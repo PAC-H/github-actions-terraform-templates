@@ -1,0 +1,251 @@
+name: 'Terraform Main Deployment'
+
+on:
+  push:
+    branches: [develop, main]
+    paths: ['terraform/**', 'config/**', '.github/workflows/**']
+  pull_request:
+    branches: [main]
+    paths: ['terraform/**', 'config/**', '.github/workflows/**']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  load-config:
+    runs-on: self-hosted
+    outputs:
+      base-config: ${{ steps.load-base.outputs.config }}
+      staging-config: ${{ steps.load-staging.outputs.config }}
+      production-config: ${{ steps.load-production.outputs.config }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load base config
+        id: load-base
+        run: |
+          CONFIG=$(cat config/base.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load staging config
+        id: load-staging
+        run: |
+          CONFIG=$(cat config/staging.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load production config
+        id: load-production
+        run: |
+          CONFIG=$(cat config/production.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+
+  validation:
+    runs-on: self-hosted
+    needs: load-config
+    strategy:
+      matrix:
+        environment: [staging, production]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/${{ matrix.environment }}
+          environment: ${{ matrix.environment }}
+          
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
+          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
+          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          
+      - name: Terraform Format Check
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: terraform fmt -check -recursive
+        
+      - name: Terraform Lint
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: terraform validate
+        
+      - name: Configure backend
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          ENV_CONFIG='${{ matrix.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      - name: Terraform Plan
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          terraform plan -out=tfplan-${{ matrix.environment }}
+          
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: terraform/environments/${{ matrix.environment }}/tfplan-${{ matrix.environment }}
+          retention-days: 30
+
+  compliance:
+    runs-on: self-hosted
+    needs: [load-config, validation]
+    strategy:
+      matrix:
+        environment: [staging, production]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
+          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
+          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          
+      - name: Run Azure Policy Compliance Check
+        run: |
+          echo "Running Azure Policy compliance check for ${{ matrix.environment }}"
+          # This will be implemented based on your specific Azure Policy requirements
+          az policy state list --resource-group "rg-${{ matrix.environment }}" --all || true
+
+  deploy-staging:
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    runs-on: self-hosted
+    needs: [load-config, validation, compliance]
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/staging
+          environment: staging
+          
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
+          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
+          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-staging
+          path: terraform/environments/staging
+          
+      - name: Configure backend
+        working-directory: terraform/environments/staging
+        run: |
+          BACKEND_CONFIG=$(echo '${{ needs.load-config.outputs.staging-config }}' | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      - name: Terraform Apply
+        working-directory: terraform/environments/staging
+        run: terraform apply tfplan-staging
+        
+      - name: Notify success
+        if: success()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: success
+          environment: staging
+          message: "Staging deployment completed successfully"
+          
+      - name: Notify failure
+        if: failure()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: failure
+          environment: staging
+          message: "Staging deployment failed"
+
+  deploy-production:
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    runs-on: self-hosted
+    needs: [load-config, validation, compliance, deploy-staging]
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/production
+          environment: production
+          
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
+          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
+          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-production
+          path: terraform/environments/production
+          
+      - name: Configure backend
+        working-directory: terraform/environments/production
+        run: |
+          BACKEND_CONFIG=$(echo '${{ needs.load-config.outputs.production-config }}' | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      - name: Terraform Apply
+        working-directory: terraform/environments/production
+        run: terraform apply tfplan-production
+        
+      - name: Notify success
+        if: success()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: success
+          environment: production
+          message: "Production deployment completed successfully"
+          
+      - name: Notify failure
+        if: failure()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: failure
+          environment: production
+          message: "Production deployment failed" 

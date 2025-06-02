@@ -1,0 +1,31 @@
+name: 'Azure Login'
+description: 'OIDC authentication with Azure'
+inputs:
+  tenant_id:
+    description: 'Azure Tenant ID'
+    required: true
+  subscription_id:
+    description: 'Azure Subscription ID'
+    required: true
+  client_id:
+    description: 'Azure Client ID for OIDC'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Azure CLI login
+      uses: azure/login@v1
+      with:
+        client-id: ${{ inputs.client_id }}
+        tenant-id: ${{ inputs.tenant_id }}
+        subscription-id: ${{ inputs.subscription_id }}
+        
+    - name: Set Azure subscription
+      shell: bash
+      run: |
+        az account set --subscription ${{ inputs.subscription_id }}
+        
+    - name: Verify authentication
+      shell: bash
+      run: |
+        az account show 

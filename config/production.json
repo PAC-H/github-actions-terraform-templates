@@ -1,0 +1,19 @@
+{
+  "environment": "production",
+  "azure": {
+    "subscription_id": "# FILL: Production subscription ID (if different)"
+  },
+  "terraform": {
+    "backend": {
+      "storage_account_name": "# FILL: Production state storage account",
+      "container_name": "# FILL: Production state container",
+      "resource_group_name": "# FILL: Production state resource group",
+      "key": "production.tfstate"
+    }
+  },
+  "deployment": {
+    "auto_apply": false,
+    "require_approval": true,
+    "max_parallel": 1
+  }
+} 

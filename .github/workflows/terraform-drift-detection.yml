@@ -1,0 +1,117 @@
+name: 'Terraform Drift Detection'
+
+on:
+  schedule:
+    - cron: '0 9 * * 0'  # Weekly on Sundays at 9 AM UTC
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  load-config:
+    runs-on: self-hosted
+    outputs:
+      base-config: ${{ steps.load-base.outputs.config }}
+      staging-config: ${{ steps.load-staging.outputs.config }}
+      production-config: ${{ steps.load-production.outputs.config }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load base config
+        id: load-base
+        run: |
+          CONFIG=$(cat config/base.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load staging config
+        id: load-staging
+        run: |
+          CONFIG=$(cat config/staging.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load production config
+        id: load-production
+        run: |
+          CONFIG=$(cat config/production.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+
+  drift-detection:
+    runs-on: self-hosted
+    needs: load-config
+    strategy:
+      matrix:
+        environment: [staging, production]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/${{ matrix.environment }}
+          environment: ${{ matrix.environment }}
+          
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
+          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
+          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          
+      - name: Configure backend
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          ENV_CONFIG='${{ matrix.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      - name: Check for drift
+        id: drift
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          terraform plan -detailed-exitcode -out=drift-plan-${{ matrix.environment }} > drift-output-${{ matrix.environment }}.txt 2>&1
+          exit_code=$?
+          echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
+          
+          if [ $exit_code -eq 2 ]; then
+            echo "has_drift=true" >> $GITHUB_OUTPUT
+            echo "Drift detected in ${{ matrix.environment }} environment"
+          else
+            echo "has_drift=false" >> $GITHUB_OUTPUT
+            echo "No drift detected in ${{ matrix.environment }} environment"
+          fi
+          
+      - name: Upload drift report
+        if: steps.drift.outputs.has_drift == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-report-${{ matrix.environment }}
+          path: |
+            terraform/environments/${{ matrix.environment }}/drift-output-${{ matrix.environment }}.txt
+            terraform/environments/${{ matrix.environment }}/drift-plan-${{ matrix.environment }}
+          retention-days: 30
+          
+      - name: Notify drift detected
+        if: steps.drift.outputs.has_drift == 'true'
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: warning
+          environment: ${{ matrix.environment }}
+          message: "Infrastructure drift detected! Please review the drift report artifact."
+          
+      - name: Notify no drift
+        if: steps.drift.outputs.has_drift == 'false'
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: success
+          environment: ${{ matrix.environment }}
+          message: "No infrastructure drift detected." 

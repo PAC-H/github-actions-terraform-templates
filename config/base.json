@@ -1,0 +1,25 @@
+{
+  "azure": {
+    "tenant_id": "# FILL: Your Azure Tenant ID",
+    "subscription_id": "# FILL: Your Azure Subscription ID",
+    "client_id": "# FILL: Your Azure Client ID for OIDC"
+  },
+  "terraform": {
+    "version": "latest",
+    "azure_provider_version": "~>3.0"
+  },
+  "github": {
+    "self_hosted_agents": {
+      "staging_pool": "# FILL: Your staging agent pool name",
+      "production_pool": "# FILL: Your production agent pool name"
+    }
+  },
+  "notifications": {
+    "teams_webhook": "# FILL: Your Teams webhook URL"
+  },
+  "storage": {
+    "backup_account": "# FILL: Backup storage account name",
+    "backup_container": "# FILL: Backup container name",
+    "backup_resource_group": "# FILL: Backup resource group name"
+  }
+} 

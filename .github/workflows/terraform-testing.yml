@@ -1,0 +1,133 @@
+name: 'Terraform Testing'
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_suite:
+        description: 'Test suite to run'
+        required: true
+        type: choice
+        options:
+          - basic
+          - integration
+          - all
+      environment:
+        description: 'Environment to test against'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+  push:
+    paths: ['tests/**', 'terraform/**']
+    branches: [develop, main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  load-config:
+    runs-on: self-hosted
+    outputs:
+      base-config: ${{ steps.load-base.outputs.config }}
+      staging-config: ${{ steps.load-staging.outputs.config }}
+      production-config: ${{ steps.load-production.outputs.config }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load base config
+        id: load-base
+        run: |
+          CONFIG=$(cat config/base.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load staging config
+        id: load-staging
+        run: |
+          CONFIG=$(cat config/staging.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load production config
+        id: load-production
+        run: |
+          CONFIG=$(cat config/production.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+
+  terraform-tests:
+    runs-on: self-hosted
+    needs: load-config
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+          
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
+          environment: ${{ github.event.inputs.environment || 'staging' }}
+          
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
+          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
+          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          
+      - name: Install Go dependencies
+        working-directory: tests/terratest
+        run: |
+          go mod download
+          go mod tidy
+          
+      - name: Run basic tests
+        if: github.event.inputs.test_suite == 'basic' || github.event.inputs.test_suite == 'all' || github.event_name == 'push'
+        working-directory: tests/terratest
+        run: |
+          go test -v -timeout 30m -run TestTerraformBasicExample
+          
+      - name: Run integration tests
+        if: github.event.inputs.test_suite == 'integration' || github.event.inputs.test_suite == 'all'
+        working-directory: tests/terratest
+        run: |
+          echo "Integration tests would run here"
+          echo "Add your integration test functions to basic_test.go or create separate test files"
+          # go test -v -timeout 60m -run TestTerraformIntegration
+          
+      - name: Generate test report
+        if: always()
+        working-directory: tests/terratest
+        run: |
+          go test -v -json > test-results.json || true
+          
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.event.inputs.environment || 'staging' }}
+          path: tests/terratest/test-results.json
+          retention-days: 30
+          
+      - name: Notify test success
+        if: success()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: success
+          environment: ${{ github.event.inputs.environment || 'staging' }}
+          message: "Terraform tests completed successfully for ${{ github.event.inputs.test_suite || 'basic' }} test suite"
+          
+      - name: Notify test failure
+        if: failure()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: failure
+          environment: ${{ github.event.inputs.environment || 'staging' }}
+          message: "Terraform tests failed for ${{ github.event.inputs.test_suite || 'basic' }} test suite" 

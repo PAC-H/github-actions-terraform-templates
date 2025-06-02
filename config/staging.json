@@ -1,0 +1,19 @@
+{
+  "environment": "staging",
+  "azure": {
+    "subscription_id": "# FILL: Staging subscription ID (if different)"
+  },
+  "terraform": {
+    "backend": {
+      "storage_account_name": "# FILL: Staging state storage account",
+      "container_name": "# FILL: Staging state container",
+      "resource_group_name": "# FILL: Staging state resource group",
+      "key": "staging.tfstate"
+    }
+  },
+  "deployment": {
+    "auto_apply": false,
+    "require_approval": true,
+    "max_parallel": 2
+  }
+} 

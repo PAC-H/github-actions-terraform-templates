@@ -1,0 +1,30 @@
+name: 'Terraform Cache'
+description: 'Cache/restore providers and modules'
+inputs:
+  environment:
+    description: 'Environment name'
+    required: true
+  cache_key:
+    description: 'Cache key'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: Cache Terraform providers
+      uses: actions/cache@v4
+      with:
+        path: |
+          .terraform
+          ~/.terraform.d/plugin-cache
+        key: ${{ inputs.cache_key }}
+        restore-keys: |
+          terraform-${{ inputs.environment }}-${{ runner.os }}-
+          
+    - name: Cache Terraform modules
+      uses: actions/cache@v4
+      with:
+        path: |
+          .terraform/modules
+        key: terraform-modules-${{ inputs.environment }}-${{ hashFiles('**/*.tf') }}
+        restore-keys: |
+          terraform-modules-${{ inputs.environment }}- 

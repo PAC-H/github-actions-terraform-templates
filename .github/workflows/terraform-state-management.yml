@@ -1,0 +1,181 @@
+name: 'Terraform State Management'
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'State operation to perform'
+        required: true
+        type: choice
+        options:
+          - unlock
+          - backup
+          - restore
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      lock_id:
+        description: 'Lock ID (required for unlock operation)'
+        required: false
+      backup_name:
+        description: 'Backup name (required for restore operation)'
+        required: false
+  schedule:
+    - cron: '0 2 * * 0'  # Weekly backup on Sundays at 2 AM UTC
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  load-config:
+    runs-on: self-hosted
+    outputs:
+      base-config: ${{ steps.load-base.outputs.config }}
+      staging-config: ${{ steps.load-staging.outputs.config }}
+      production-config: ${{ steps.load-production.outputs.config }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load base config
+        id: load-base
+        run: |
+          CONFIG=$(cat config/base.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load staging config
+        id: load-staging
+        run: |
+          CONFIG=$(cat config/staging.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load production config
+        id: load-production
+        run: |
+          CONFIG=$(cat config/production.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+
+  state-operation:
+    runs-on: self-hosted
+    needs: load-config
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        if: github.event.inputs.operation == 'unlock'
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
+          environment: ${{ github.event.inputs.environment || 'staging' }}
+          
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
+          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
+          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          
+      - name: Unlock state
+        if: github.event.inputs.operation == 'unlock'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+          terraform force-unlock ${{ github.event.inputs.lock_id }}
+          
+      - name: Backup state files
+        if: github.event.inputs.operation == 'backup' || github.event_name == 'schedule'
+        run: |
+          # Get current timestamp
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          
+          # Backup staging state
+          STAGING_CONFIG='${{ needs.load-config.outputs.staging-config }}'
+          STAGING_BACKEND=$(echo $STAGING_CONFIG | jq -r '.terraform.backend')
+          
+          az storage blob download \
+            --account-name $(echo $STAGING_BACKEND | jq -r '.storage_account_name') \
+            --container-name $(echo $STAGING_BACKEND | jq -r '.container_name') \
+            --name $(echo $STAGING_BACKEND | jq -r '.key') \
+            --file staging-${TIMESTAMP}.tfstate
+            
+          # Backup production state
+          PRODUCTION_CONFIG='${{ needs.load-config.outputs.production-config }}'
+          PRODUCTION_BACKEND=$(echo $PRODUCTION_CONFIG | jq -r '.terraform.backend')
+          
+          az storage blob download \
+            --account-name $(echo $PRODUCTION_BACKEND | jq -r '.storage_account_name') \
+            --container-name $(echo $PRODUCTION_BACKEND | jq -r '.container_name') \
+            --name $(echo $PRODUCTION_BACKEND | jq -r '.key') \
+            --file production-${TIMESTAMP}.tfstate
+            
+          # Upload to backup storage
+          BASE_CONFIG='${{ needs.load-config.outputs.base-config }}'
+          BACKUP_STORAGE=$(echo $BASE_CONFIG | jq -r '.storage')
+          
+          az storage blob upload \
+            --account-name $(echo $BACKUP_STORAGE | jq -r '.backup_account') \
+            --container-name $(echo $BACKUP_STORAGE | jq -r '.backup_container') \
+            --name staging-${TIMESTAMP}.tfstate \
+            --file staging-${TIMESTAMP}.tfstate
+            
+          az storage blob upload \
+            --account-name $(echo $BACKUP_STORAGE | jq -r '.backup_account') \
+            --container-name $(echo $BACKUP_STORAGE | jq -r '.backup_container') \
+            --name production-${TIMESTAMP}.tfstate \
+            --file production-${TIMESTAMP}.tfstate
+            
+      - name: Restore state file
+        if: github.event.inputs.operation == 'restore'
+        run: |
+          # Download backup from backup storage
+          BASE_CONFIG='${{ needs.load-config.outputs.base-config }}'
+          BACKUP_STORAGE=$(echo $BASE_CONFIG | jq -r '.storage')
+          
+          az storage blob download \
+            --account-name $(echo $BACKUP_STORAGE | jq -r '.backup_account') \
+            --container-name $(echo $BACKUP_STORAGE | jq -r '.backup_container') \
+            --name ${{ github.event.inputs.backup_name }} \
+            --file restored.tfstate
+            
+          # Upload to environment state storage
+          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          az storage blob upload \
+            --account-name $(echo $BACKEND_CONFIG | jq -r '.storage_account_name') \
+            --container-name $(echo $BACKEND_CONFIG | jq -r '.container_name') \
+            --name $(echo $BACKEND_CONFIG | jq -r '.key') \
+            --file restored.tfstate \
+            --overwrite
+            
+      - name: Notify success
+        if: success()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: success
+          environment: ${{ github.event.inputs.environment || 'all' }}
+          message: "State ${{ github.event.inputs.operation || 'backup' }} operation completed successfully"
+          
+      - name: Notify failure
+        if: failure()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: failure
+          environment: ${{ github.event.inputs.environment || 'all' }}
+          message: "State ${{ github.event.inputs.operation || 'backup' }} operation failed" 

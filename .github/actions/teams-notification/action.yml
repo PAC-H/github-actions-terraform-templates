@@ -1,0 +1,76 @@
+name: 'Teams Notification'
+description: 'Send formatted Teams notifications'
+inputs:
+  webhook_url:
+    description: 'Teams webhook URL'
+    required: true
+  status:
+    description: 'Status (success/failure/warning)'
+    required: true
+  environment:
+    description: 'Environment name'
+    required: true
+  message:
+    description: 'Custom message'
+    required: false
+    default: ''
+runs:
+  using: 'composite'
+  steps:
+    - name: Send Teams notification
+      shell: bash
+      run: |
+        STATUS_COLOR=""
+        STATUS_ICON=""
+        case "${{ inputs.status }}" in
+          "success")
+            STATUS_COLOR="28a745"
+            STATUS_ICON="✅"
+            ;;
+          "failure")
+            STATUS_COLOR="dc3545"
+            STATUS_ICON="❌"
+            ;;
+          "warning")
+            STATUS_COLOR="ffc107"
+            STATUS_ICON="⚠️"
+            ;;
+        esac
+        
+        PAYLOAD=$(cat <<EOF
+        {
+          "@type": "MessageCard",
+          "@context": "http://schema.org/extensions",
+          "themeColor": "$STATUS_COLOR",
+          "summary": "Terraform Pipeline - ${{ inputs.environment }}",
+          "sections": [{
+            "activityTitle": "$STATUS_ICON Terraform Pipeline - ${{ inputs.environment }}",
+            "activitySubtitle": "Status: ${{ inputs.status }}",
+            "facts": [{
+              "name": "Repository:",
+              "value": "${{ github.repository }}"
+            }, {
+              "name": "Branch:",
+              "value": "${{ github.ref_name }}"
+            }, {
+              "name": "Commit:",
+              "value": "${{ github.sha }}"
+            }, {
+              "name": "Actor:",
+              "value": "${{ github.actor }}"
+            }],
+            "text": "${{ inputs.message }}"
+          }],
+          "potentialAction": [{
+            "@type": "OpenUri",
+            "name": "View Run",
+            "targets": [{
+              "os": "default",
+              "uri": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }]
+          }]
+        }
+        EOF
+        )
+        
+        curl -H "Content-Type: application/json" -d "$PAYLOAD" "${{ inputs.webhook_url }}" 

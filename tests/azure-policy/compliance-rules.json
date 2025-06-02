@@ -1,0 +1,43 @@
+{
+  "compliance_rules": {
+    "required_tags": {
+      "description": "Resources must have required tags",
+      "tags": ["Environment", "ManagedBy", "Owner", "CostCenter"]
+    },
+    "resource_naming": {
+      "description": "Resources must follow naming conventions",
+      "patterns": {
+        "resource_groups": "rg-{environment}-{purpose}",
+        "storage_accounts": "st{environment}{purpose}",
+        "virtual_networks": "vnet-{environment}-{purpose}"
+      }
+    },
+    "security_requirements": {
+      "description": "Security compliance requirements",
+      "rules": [
+        "Storage accounts must use HTTPS only",
+        "Network security groups must not allow unrestricted inbound access",
+        "Virtual machines must have antimalware extensions",
+        "Key vaults must have soft delete enabled"
+      ]
+    },
+    "cost_management": {
+      "description": "Cost optimization rules",
+      "rules": [
+        "Virtual machines must be appropriate sizes",
+        "Unused resources must be identified and removed",
+        "Storage accounts must use appropriate tiers"
+      ]
+    }
+  },
+  "exemptions": {
+    "development": {
+      "description": "Exemptions for development environments",
+      "exempt_rules": ["cost_management"]
+    },
+    "testing": {
+      "description": "Exemptions for testing environments", 
+      "exempt_rules": ["cost_management"]
+    }
+  }
+} 

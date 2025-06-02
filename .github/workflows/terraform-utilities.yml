@@ -1,0 +1,230 @@
+name: 'Terraform Utilities'
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'Utility operation to perform'
+        required: true
+        type: choice
+        options:
+          - tfupdate
+          - dependency-graph
+          - target-apply
+          - target-destroy
+      environment:
+        description: 'Environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      target_resources:
+        description: 'Target resources (comma-separated, required for target operations)'
+        required: false
+  push:
+    paths: ['terraform/**']
+    branches: [develop, main]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  load-config:
+    runs-on: self-hosted
+    outputs:
+      base-config: ${{ steps.load-base.outputs.config }}
+      staging-config: ${{ steps.load-staging.outputs.config }}
+      production-config: ${{ steps.load-production.outputs.config }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load base config
+        id: load-base
+        run: |
+          CONFIG=$(cat config/base.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load staging config
+        id: load-staging
+        run: |
+          CONFIG=$(cat config/staging.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load production config
+        id: load-production
+        run: |
+          CONFIG=$(cat config/production.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+
+  tfupdate:
+    if: github.event.inputs.operation == 'tfupdate' || github.event_name == 'push'
+    runs-on: self-hosted
+    needs: load-config
+    strategy:
+      matrix:
+        environment: [staging, production]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install tfupdate
+        run: |
+          curl -fsSL https://github.com/minamijoyo/tfupdate/releases/download/v0.7.1/tfupdate_0.7.1_linux_amd64.tar.gz | tar -xz
+          sudo mv tfupdate /usr/local/bin/
+          
+      - name: Update Terraform providers
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          tfupdate provider azurerm --version "> 3.0, < 4.0" .
+          
+      - name: Check for updates
+        id: check-updates
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          if git diff --quiet; then
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Create Pull Request
+        if: steps.check-updates.outputs.has_updates == 'true' && github.event_name == 'push'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: update terraform providers for ${{ matrix.environment }}"
+          title: "Update Terraform providers for ${{ matrix.environment }}"
+          body: |
+            Automated Terraform provider updates for ${{ matrix.environment }} environment.
+            
+            Changes made by tfupdate:
+            - Updated provider versions to latest compatible versions
+            
+            Please review the changes before merging.
+          branch: tfupdate-${{ matrix.environment }}-${{ github.run_number }}
+
+  dependency-graph:
+    if: github.event.inputs.operation == 'dependency-graph'
+    runs-on: self-hosted
+    needs: load-config
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/${{ github.event.inputs.environment }}
+          environment: ${{ github.event.inputs.environment }}
+          
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
+          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
+          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          
+      - name: Configure backend
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      - name: Generate dependency graph
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          terraform graph | dot -Tsvg > dependency-graph-${{ github.event.inputs.environment }}.svg
+          terraform graph | dot -Tpng > dependency-graph-${{ github.event.inputs.environment }}.png
+          
+      - name: Upload dependency graph
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-graph-${{ github.event.inputs.environment }}
+          path: |
+            terraform/environments/${{ github.event.inputs.environment }}/dependency-graph-${{ github.event.inputs.environment }}.svg
+            terraform/environments/${{ github.event.inputs.environment }}/dependency-graph-${{ github.event.inputs.environment }}.png
+          retention-days: 30
+
+  target-operations:
+    if: github.event.inputs.operation == 'target-apply' || github.event.inputs.operation == 'target-destroy'
+    runs-on: self-hosted
+    needs: load-config
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/${{ github.event.inputs.environment }}
+          environment: ${{ github.event.inputs.environment }}
+          
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
+          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
+          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          
+      - name: Configure backend
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      - name: Prepare target flags
+        id: targets
+        run: |
+          TARGETS="${{ github.event.inputs.target_resources }}"
+          TARGET_FLAGS=""
+          IFS=',' read -ra TARGET_ARRAY <<< "$TARGETS"
+          for target in "${TARGET_ARRAY[@]}"; do
+            TARGET_FLAGS="$TARGET_FLAGS -target=$target"
+          done
+          echo "flags=$TARGET_FLAGS" >> $GITHUB_OUTPUT
+          
+      - name: Plan targeted operation
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          if [ "${{ github.event.inputs.operation }}" = "target-destroy" ]; then
+            terraform plan -destroy ${{ steps.targets.outputs.flags }} -out=target-plan
+          else
+            terraform plan ${{ steps.targets.outputs.flags }} -out=target-plan
+          fi
+          
+      - name: Apply targeted operation
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: terraform apply target-plan
+        
+      - name: Notify success
+        if: success()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: success
+          environment: ${{ github.event.inputs.environment }}
+          message: "Target operation ${{ github.event.inputs.operation }} completed successfully for resources: ${{ github.event.inputs.target_resources }}"
+          
+      - name: Notify failure
+        if: failure()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: failure
+          environment: ${{ github.event.inputs.environment }}
+          message: "Target operation ${{ github.event.inputs.operation }} failed for resources: ${{ github.event.inputs.target_resources }}" 

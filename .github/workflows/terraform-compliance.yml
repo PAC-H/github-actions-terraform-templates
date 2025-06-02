@@ -1,0 +1,196 @@
+name: 'Terraform Compliance'
+
+on:
+  pull_request:
+    branches: [main, develop]
+    paths: ['terraform/**']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to check'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+          - all
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  load-config:
+    runs-on: self-hosted
+    outputs:
+      base-config: ${{ steps.load-base.outputs.config }}
+      staging-config: ${{ steps.load-staging.outputs.config }}
+      production-config: ${{ steps.load-production.outputs.config }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load base config
+        id: load-base
+        run: |
+          CONFIG=$(cat config/base.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load staging config
+        id: load-staging
+        run: |
+          CONFIG=$(cat config/staging.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          
+      - name: Load production config
+        id: load-production
+        run: |
+          CONFIG=$(cat config/production.json | jq -c .)
+          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+
+  compliance-check:
+    runs-on: self-hosted
+    needs: load-config
+    strategy:
+      matrix:
+        environment: ${{ github.event.inputs.environment == 'all' && fromJson('["staging", "production"]') || github.event.inputs.environment && fromJson(format('["{0}"]', github.event.inputs.environment)) || fromJson('["staging", "production"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/${{ matrix.environment }}
+          environment: ${{ matrix.environment }}
+          
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
+          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
+          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          
+      - name: Configure backend
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          ENV_CONFIG='${{ matrix.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      - name: Generate plan for compliance check
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          terraform plan -out=compliance-plan-${{ matrix.environment }}
+          terraform show -json compliance-plan-${{ matrix.environment }} > compliance-plan-${{ matrix.environment }}.json
+          
+      - name: Install tflint
+        run: |
+          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+          
+      - name: Run tflint security checks
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          tflint --init
+          tflint --format json > tflint-report-${{ matrix.environment }}.json || true
+          
+      - name: Install checkov
+        run: |
+          pip3 install checkov
+          
+      - name: Run checkov security scan
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          checkov -f compliance-plan-${{ matrix.environment }}.json --framework terraform_plan --output json > checkov-report-${{ matrix.environment }}.json || true
+          
+      - name: Check Azure Policy compliance
+        run: |
+          echo "Checking Azure Policy compliance for ${{ matrix.environment }} environment..."
+          
+          # Get resource groups for the environment
+          RESOURCE_GROUPS=$(az group list --query "[?contains(name, '${{ matrix.environment }}')].name" -o tsv)
+          
+          # Create compliance report
+          echo '{"environment": "${{ matrix.environment }}", "policy_states": []}' > policy-compliance-${{ matrix.environment }}.json
+          
+          for rg in $RESOURCE_GROUPS; do
+            echo "Checking resource group: $rg"
+            az policy state list --resource-group "$rg" --query '[].{policyDefinitionName: policyDefinitionName, complianceState: complianceState, resourceId: resourceId}' >> policy-states-temp.json || true
+          done
+          
+          # Merge policy states into main report
+          if [ -f policy-states-temp.json ]; then
+            jq '.policy_states += input' policy-compliance-${{ matrix.environment }}.json policy-states-temp.json > temp.json
+            mv temp.json policy-compliance-${{ matrix.environment }}.json
+            rm policy-states-temp.json
+          fi
+          
+      - name: Generate compliance summary
+        run: |
+          # Create comprehensive compliance report
+          cat > compliance-summary-${{ matrix.environment }}.md << EOF
+          # Compliance Report - ${{ matrix.environment }} Environment
+          
+          ## TFLint Security Checks
+          \`\`\`json
+          $(cat terraform/environments/${{ matrix.environment }}/tflint-report-${{ matrix.environment }}.json 2>/dev/null || echo "{}")
+          \`\`\`
+          
+          ## Checkov Security Scan
+          \`\`\`json
+          $(cat terraform/environments/${{ matrix.environment }}/checkov-report-${{ matrix.environment }}.json 2>/dev/null || echo "{}")
+          \`\`\`
+          
+          ## Azure Policy Compliance
+          \`\`\`json
+          $(cat policy-compliance-${{ matrix.environment }}.json 2>/dev/null || echo "{}")
+          \`\`\`
+          
+          ## Summary
+          - **Environment**: ${{ matrix.environment }}
+          - **Scan Date**: $(date)
+          - **Repository**: ${{ github.repository }}
+          - **Commit**: ${{ github.sha }}
+          EOF
+          
+      - name: Upload compliance reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-report-${{ matrix.environment }}
+          path: |
+            terraform/environments/${{ matrix.environment }}/tflint-report-${{ matrix.environment }}.json
+            terraform/environments/${{ matrix.environment }}/checkov-report-${{ matrix.environment }}.json
+            policy-compliance-${{ matrix.environment }}.json
+            compliance-summary-${{ matrix.environment }}.md
+          retention-days: 30
+          
+      - name: Comment PR with compliance results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            try {
+              const summary = fs.readFileSync('compliance-summary-${{ matrix.environment }}.md', 'utf8');
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: summary
+              });
+            } catch (error) {
+              console.log('Could not read compliance summary file');
+            }
+            
+      - name: Notify compliance results
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: success
+          environment: ${{ matrix.environment }}
+          message: "Compliance check completed for ${{ matrix.environment }}. Check artifacts for detailed results." 
