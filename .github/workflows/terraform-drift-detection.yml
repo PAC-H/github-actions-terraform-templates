@@ -1,15 +1,42 @@
+# =============================================================================
+# TERRAFORM DRIFT DETECTION PIPELINE
+# =============================================================================
+# This workflow automatically detects infrastructure drift by comparing the
+# current state of resources in Azure with the expected state defined in
+# Terraform configurations. It runs weekly but can also be triggered manually.
+#
+# Key Features:
+# - Automated weekly execution (Sundays at 9 AM UTC)
+# - Parallel drift detection for both staging and production
+# - Detailed drift reports saved as artifacts
+# - Teams notifications for drift alerts
+# - Non-destructive - only detects changes, doesn't fix them
+# =============================================================================
+
 name: 'Terraform Drift Detection'
 
+# =============================================================================
+# TRIGGERS: Scheduled weekly runs + manual execution
+# =============================================================================
 on:
   schedule:
-    - cron: '0 9 * * 0'  # Weekly on Sundays at 9 AM UTC
-  workflow_dispatch:
+    - cron: '0 9 * * 0'  # Weekly on Sundays at 9 AM UTC (adjust timezone as needed)
+  workflow_dispatch:      # Allow manual triggering for immediate drift checks
 
+# =============================================================================
+# PERMISSIONS: Required for Azure OIDC authentication
+# =============================================================================
 permissions:
-  id-token: write
-  contents: read
+  id-token: write  # Required for OIDC token generation
+  contents: read   # Read repository contents and configurations
 
 jobs:
+  # ===========================================================================
+  # CONFIGURATION LOADING JOB
+  # ===========================================================================
+  # Same configuration loading pattern as main deployment workflow
+  # to ensure consistent environment settings across all pipelines
+  # ===========================================================================
   load-config:
     runs-on: self-hosted
     outputs:
@@ -19,12 +46,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      # Load shared configuration (Azure credentials, notification settings)
       - name: Load base config
         id: load-base
         run: |
           CONFIG=$(cat config/base.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
           
+      # Load environment-specific backend configurations
       - name: Load staging config
         id: load-staging
         run: |
@@ -37,15 +66,23 @@ jobs:
           CONFIG=$(cat config/production.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
 
+  # ===========================================================================
+  # DRIFT DETECTION JOB
+  # ===========================================================================
+  # Runs terraform plan with -detailed-exitcode to detect any differences
+  # between current infrastructure state and Terraform configuration.
+  # Uses matrix strategy to check both environments in parallel.
+  # ===========================================================================
   drift-detection:
     runs-on: self-hosted
     needs: load-config
     strategy:
       matrix:
-        environment: [staging, production]
+        environment: [staging, production]  # Check both environments simultaneously
     steps:
       - uses: actions/checkout@v4
       
+      # Setup Terraform with caching for performance
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
@@ -53,6 +90,7 @@ jobs:
           working_directory: terraform/environments/${{ matrix.environment }}
           environment: ${{ matrix.environment }}
           
+      # Authenticate with Azure to access current resource state
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
@@ -60,26 +98,33 @@ jobs:
           subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
           client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
           
+      # Initialize Terraform with the appropriate backend for this environment
       - name: Configure backend
         working-directory: terraform/environments/${{ matrix.environment }}
         run: |
+          # Select appropriate config based on current environment
           ENV_CONFIG='${{ matrix.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
           BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
           
+          # Initialize with environment-specific state backend
           terraform init \
             -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
             -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
             
+      # Run terraform plan with detailed exit codes to detect drift
       - name: Check for drift
         id: drift
         working-directory: terraform/environments/${{ matrix.environment }}
         run: |
+          # Run terraform plan with detailed exit codes:
+          # 0 = no changes, 1 = error, 2 = changes detected (drift)
           terraform plan -detailed-exitcode -out=drift-plan-${{ matrix.environment }} > drift-output-${{ matrix.environment }}.txt 2>&1
           exit_code=$?
           echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
           
+          # Interpret the exit code and set drift flag
           if [ $exit_code -eq 2 ]; then
             echo "has_drift=true" >> $GITHUB_OUTPUT
             echo "Drift detected in ${{ matrix.environment }} environment"
@@ -88,6 +133,7 @@ jobs:
             echo "No drift detected in ${{ matrix.environment }} environment"
           fi
           
+      # Save drift analysis reports as artifacts for review
       - name: Upload drift report
         if: steps.drift.outputs.has_drift == 'true'
         uses: actions/upload-artifact@v4
@@ -98,6 +144,7 @@ jobs:
             terraform/environments/${{ matrix.environment }}/drift-plan-${{ matrix.environment }}
           retention-days: 30
           
+      # Alert team via Teams when drift is detected (requires immediate attention)
       - name: Notify drift detected
         if: steps.drift.outputs.has_drift == 'true'
         uses: ./.github/actions/teams-notification
@@ -107,6 +154,7 @@ jobs:
           environment: ${{ matrix.environment }}
           message: "Infrastructure drift detected! Please review the drift report artifact."
           
+      # Send confirmation when no drift is found (good news!)
       - name: Notify no drift
         if: steps.drift.outputs.has_drift == 'false'
         uses: ./.github/actions/teams-notification

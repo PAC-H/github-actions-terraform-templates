@@ -1,10 +1,31 @@
+# =============================================================================
+# TERRAFORM COMPLIANCE PIPELINE
+# =============================================================================
+# This workflow provides comprehensive security and compliance validation for
+# Terraform infrastructure using multiple scanning tools:
+#
+# 1. TFLINT: Terraform-specific linting and best practices
+# 2. CHECKOV: Security vulnerability scanning and compliance checks
+# 3. AZURE POLICY: Live policy compliance validation against Azure policies
+#
+# Key Features:
+# - Multi-tool security scanning for comprehensive coverage
+# - PR integration with automatic compliance reports
+# - Azure Policy integration for live environment checking
+# - Artifact storage for compliance audit trails
+# - Teams notifications for compliance status
+# =============================================================================
+
 name: 'Terraform Compliance'
 
+# =============================================================================
+# TRIGGERS: PR validation + manual compliance checks
+# =============================================================================
 on:
   pull_request:
-    branches: [main, develop]
-    paths: ['terraform/**']
-  workflow_dispatch:
+    branches: [main, develop]      # Run compliance checks on all PRs
+    paths: ['terraform/**']        # Only when Terraform files are modified
+  workflow_dispatch:               # Manual execution for compliance audits
     inputs:
       environment:
         description: 'Environment to check'
@@ -13,14 +34,22 @@ on:
         options:
           - staging
           - production
-          - all
+          - all                    # Check all environments
 
+# =============================================================================
+# PERMISSIONS: Enhanced permissions for PR comments and Azure access
+# =============================================================================
 permissions:
-  id-token: write
-  contents: read
-  pull-requests: write
+  id-token: write       # Required for OIDC authentication
+  contents: read        # Read repository contents and configurations
+  pull-requests: write  # Comment on PRs with compliance results
 
 jobs:
+  # ===========================================================================
+  # CONFIGURATION LOADING JOB
+  # ===========================================================================
+  # Standard configuration loading for consistent environment settings
+  # ===========================================================================
   load-config:
     runs-on: self-hosted
     outputs:
@@ -30,12 +59,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      # Load shared configuration for Azure access and notifications
       - name: Load base config
         id: load-base
         run: |
           CONFIG=$(cat config/base.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
           
+      # Load environment-specific configurations for backend access
       - name: Load staging config
         id: load-staging
         run: |
@@ -48,15 +79,27 @@ jobs:
           CONFIG=$(cat config/production.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
 
+  # ===========================================================================
+  # COMPLIANCE CHECK JOB
+  # ===========================================================================
+  # Performs comprehensive security and compliance scanning using:
+  # - TFLint for Terraform best practices and syntax issues
+  # - Checkov for security vulnerabilities and misconfigurations
+  # - Azure Policy for live environment policy compliance
+  #
+  # Uses matrix strategy to check multiple environments in parallel
+  # ===========================================================================
   compliance-check:
     runs-on: self-hosted
     needs: load-config
     strategy:
       matrix:
+        # Dynamic environment selection based on input or default to both
         environment: ${{ github.event.inputs.environment == 'all' && fromJson('["staging", "production"]') || github.event.inputs.environment && fromJson(format('["{0}"]', github.event.inputs.environment)) || fromJson('["staging", "production"]') }}
     steps:
       - uses: actions/checkout@v4
       
+      # Setup Terraform for plan generation and validation
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
@@ -64,6 +107,7 @@ jobs:
           working_directory: terraform/environments/${{ matrix.environment }}
           environment: ${{ matrix.environment }}
           
+      # Authenticate with Azure for policy compliance checks
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
@@ -71,9 +115,11 @@ jobs:
           subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
           client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
           
+      # Initialize Terraform to generate plan for compliance scanning
       - name: Configure backend
         working-directory: terraform/environments/${{ matrix.environment }}
         run: |
+          # Initialize with environment-specific backend
           ENV_CONFIG='${{ matrix.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
           BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
           
@@ -83,12 +129,15 @@ jobs:
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
             
+      # Generate plan for compliance analysis (in JSON format for tools)
       - name: Generate plan for compliance check
         working-directory: terraform/environments/${{ matrix.environment }}
         run: |
           terraform plan -out=compliance-plan-${{ matrix.environment }}
+          # Convert plan to JSON for security scanning tools
           terraform show -json compliance-plan-${{ matrix.environment }} > compliance-plan-${{ matrix.environment }}.json
           
+      # Install and run TFLint for Terraform best practices
       - name: Install tflint
         run: |
           curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
@@ -96,9 +145,12 @@ jobs:
       - name: Run tflint security checks
         working-directory: terraform/environments/${{ matrix.environment }}
         run: |
+          # Initialize TFLint with latest rule definitions
           tflint --init
+          # Run TFLint and generate JSON report (continue on failures for reporting)
           tflint --format json > tflint-report-${{ matrix.environment }}.json || true
           
+      # Install and run Checkov for security vulnerability scanning
       - name: Install checkov
         run: |
           pip3 install checkov
@@ -106,33 +158,38 @@ jobs:
       - name: Run checkov security scan
         working-directory: terraform/environments/${{ matrix.environment }}
         run: |
+          # Scan the Terraform plan for security issues and misconfigurations
           checkov -f compliance-plan-${{ matrix.environment }}.json --framework terraform_plan --output json > checkov-report-${{ matrix.environment }}.json || true
           
+      # Check live Azure Policy compliance for existing resources
       - name: Check Azure Policy compliance
         run: |
           echo "Checking Azure Policy compliance for ${{ matrix.environment }} environment..."
           
-          # Get resource groups for the environment
+          # Query resource groups that match the environment naming pattern
           RESOURCE_GROUPS=$(az group list --query "[?contains(name, '${{ matrix.environment }}')].name" -o tsv)
           
-          # Create compliance report
+          # Initialize compliance report structure
           echo '{"environment": "${{ matrix.environment }}", "policy_states": []}' > policy-compliance-${{ matrix.environment }}.json
           
+          # Check policy compliance for each resource group
           for rg in $RESOURCE_GROUPS; do
             echo "Checking resource group: $rg"
+            # Query policy compliance state and append to temporary file
             az policy state list --resource-group "$rg" --query '[].{policyDefinitionName: policyDefinitionName, complianceState: complianceState, resourceId: resourceId}' >> policy-states-temp.json || true
           done
           
-          # Merge policy states into main report
+          # Merge policy states into main compliance report
           if [ -f policy-states-temp.json ]; then
             jq '.policy_states += input' policy-compliance-${{ matrix.environment }}.json policy-states-temp.json > temp.json
             mv temp.json policy-compliance-${{ matrix.environment }}.json
             rm policy-states-temp.json
           fi
           
+      # Generate comprehensive compliance summary report
       - name: Generate compliance summary
         run: |
-          # Create comprehensive compliance report
+          # Create markdown report combining all compliance check results
           cat > compliance-summary-${{ matrix.environment }}.md << EOF
           # Compliance Report - ${{ matrix.environment }} Environment
           
@@ -158,6 +215,7 @@ jobs:
           - **Commit**: ${{ github.sha }}
           EOF
           
+      # Store all compliance reports as artifacts for audit trail
       - name: Upload compliance reports
         uses: actions/upload-artifact@v4
         with:
@@ -169,6 +227,7 @@ jobs:
             compliance-summary-${{ matrix.environment }}.md
           retention-days: 30
           
+      # Post compliance summary as PR comment for visibility
       - name: Comment PR with compliance results
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
@@ -176,7 +235,9 @@ jobs:
           script: |
             const fs = require('fs');
             try {
+              // Read the generated compliance summary
               const summary = fs.readFileSync('compliance-summary-${{ matrix.environment }}.md', 'utf8');
+              // Post as comment on the PR
               github.rest.issues.createComment({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
@@ -187,6 +248,7 @@ jobs:
               console.log('Could not read compliance summary file');
             }
             
+      # Notify team of compliance check completion
       - name: Notify compliance results
         uses: ./.github/actions/teams-notification
         with:

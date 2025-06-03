@@ -1,17 +1,37 @@
+# =============================================================================
+# TERRAFORM UTILITIES PIPELINE
+# =============================================================================
+# This workflow provides utility operations for Terraform management:
+#
+# 1. TFUPDATE: Automatically update Terraform provider versions
+# 2. DEPENDENCY GRAPH: Generate visual dependency graphs of resources
+# 3. TARGET OPERATIONS: Apply/destroy specific resources safely
+#
+# Key Features:
+# - Automated provider updates with PR creation
+# - Visual dependency mapping for troubleshooting
+# - Surgical infrastructure changes via targeting
+# - Parallel execution for efficiency
+# - Smart triggering based on file changes
+# =============================================================================
+
 name: 'Terraform Utilities'
 
+# =============================================================================
+# TRIGGERS: Manual operations + automatic provider updates
+# =============================================================================
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # Manual execution with operation selection
     inputs:
       operation:
         description: 'Utility operation to perform'
         required: true
         type: choice
         options:
-          - tfupdate
-          - dependency-graph
-          - target-apply
-          - target-destroy
+          - tfupdate        # Update provider versions
+          - dependency-graph # Generate resource dependency graph
+          - target-apply    # Apply changes to specific resources only
+          - target-destroy  # Destroy specific resources only
       environment:
         description: 'Environment'
         required: true
@@ -23,15 +43,23 @@ on:
         description: 'Target resources (comma-separated, required for target operations)'
         required: false
   push:
-    paths: ['terraform/**']
+    paths: ['terraform/**']        # Auto-trigger tfupdate when Terraform files change
     branches: [develop, main]
 
+# =============================================================================
+# PERMISSIONS: Enhanced permissions for PR creation and resource management
+# =============================================================================
 permissions:
-  id-token: write
-  contents: read
-  pull-requests: write
+  id-token: write       # Required for OIDC authentication
+  contents: read        # Read repository contents
+  pull-requests: write  # Create PRs for automated updates
 
 jobs:
+  # ===========================================================================
+  # CONFIGURATION LOADING JOB
+  # ===========================================================================
+  # Standard configuration loading for consistent environment settings
+  # ===========================================================================
   load-config:
     runs-on: self-hosted
     outputs:
@@ -41,12 +69,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      # Load shared configuration (Azure credentials, notification settings)
       - name: Load base config
         id: load-base
         run: |
           CONFIG=$(cat config/base.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
           
+      # Load environment-specific configurations
       - name: Load staging config
         id: load-staging
         run: |
@@ -59,26 +89,37 @@ jobs:
           CONFIG=$(cat config/production.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
 
+  # ===========================================================================
+  # TFUPDATE JOB
+  # ===========================================================================
+  # Automatically updates Terraform provider versions and creates PRs
+  # Runs on push events to catch outdated providers early
+  # Uses matrix strategy to update both environments in parallel
+  # ===========================================================================
   tfupdate:
     if: github.event.inputs.operation == 'tfupdate' || github.event_name == 'push'
     runs-on: self-hosted
     needs: load-config
     strategy:
       matrix:
-        environment: [staging, production]
+        environment: [staging, production]  # Update both environments
     steps:
       - uses: actions/checkout@v4
       
+      # Install tfupdate tool for automated provider updates
       - name: Install tfupdate
         run: |
           curl -fsSL https://github.com/minamijoyo/tfupdate/releases/download/v0.7.1/tfupdate_0.7.1_linux_amd64.tar.gz | tar -xz
           sudo mv tfupdate /usr/local/bin/
           
+      # Update Azure provider to latest compatible version
       - name: Update Terraform providers
         working-directory: terraform/environments/${{ matrix.environment }}
         run: |
+          # Update azurerm provider within compatible version range
           tfupdate provider azurerm --version "> 3.0, < 4.0" .
           
+      # Check if any files were modified by the update
       - name: Check for updates
         id: check-updates
         working-directory: terraform/environments/${{ matrix.environment }}
@@ -89,6 +130,7 @@ jobs:
             echo "has_updates=true" >> $GITHUB_OUTPUT
           fi
           
+      # Automatically create PR for provider updates (only on push events)
       - name: Create Pull Request
         if: steps.check-updates.outputs.has_updates == 'true' && github.event_name == 'push'
         uses: peter-evans/create-pull-request@v5
@@ -105,6 +147,13 @@ jobs:
             Please review the changes before merging.
           branch: tfupdate-${{ matrix.environment }}-${{ github.run_number }}
 
+  # ===========================================================================
+  # DEPENDENCY GRAPH JOB
+  # ===========================================================================
+  # Generates visual dependency graphs showing resource relationships
+  # Useful for understanding infrastructure dependencies and troubleshooting
+  # Outputs both SVG and PNG formats for different use cases
+  # ===========================================================================
   dependency-graph:
     if: github.event.inputs.operation == 'dependency-graph'
     runs-on: self-hosted
@@ -112,6 +161,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      # Setup Terraform for graph generation
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
@@ -119,6 +169,7 @@ jobs:
           working_directory: terraform/environments/${{ github.event.inputs.environment }}
           environment: ${{ github.event.inputs.environment }}
           
+      # Authenticate with Azure to access current state
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
@@ -126,6 +177,7 @@ jobs:
           subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
           client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
           
+      # Initialize Terraform to access state and generate accurate graph
       - name: Configure backend
         working-directory: terraform/environments/${{ github.event.inputs.environment }}
         run: |
@@ -138,12 +190,15 @@ jobs:
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
             
+      # Generate dependency graph in multiple formats
       - name: Generate dependency graph
         working-directory: terraform/environments/${{ github.event.inputs.environment }}
         run: |
+          # Generate visual dependency graph using Graphviz
           terraform graph | dot -Tsvg > dependency-graph-${{ github.event.inputs.environment }}.svg
           terraform graph | dot -Tpng > dependency-graph-${{ github.event.inputs.environment }}.png
           
+      # Save generated graphs as downloadable artifacts
       - name: Upload dependency graph
         uses: actions/upload-artifact@v4
         with:
@@ -153,14 +208,26 @@ jobs:
             terraform/environments/${{ github.event.inputs.environment }}/dependency-graph-${{ github.event.inputs.environment }}.png
           retention-days: 30
 
+  # ===========================================================================
+  # TARGET OPERATIONS JOB
+  # ===========================================================================
+  # Performs surgical apply/destroy operations on specific resources
+  # Useful for:
+  # - Fixing individual resource issues without full deployment
+  # - Testing changes on specific components
+  # - Emergency resource removal
+  #
+  # SAFETY: Requires environment approval for production operations
+  # ===========================================================================
   target-operations:
     if: github.event.inputs.operation == 'target-apply' || github.event.inputs.operation == 'target-destroy'
     runs-on: self-hosted
     needs: load-config
-    environment: ${{ github.event.inputs.environment }}
+    environment: ${{ github.event.inputs.environment }}  # Triggers approval for production
     steps:
       - uses: actions/checkout@v4
       
+      # Setup Terraform for targeted operations
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
@@ -168,6 +235,7 @@ jobs:
           working_directory: terraform/environments/${{ github.event.inputs.environment }}
           environment: ${{ github.event.inputs.environment }}
           
+      # Authenticate with Azure for resource operations
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
@@ -175,6 +243,7 @@ jobs:
           subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
           client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
           
+      # Initialize Terraform backend for the target environment
       - name: Configure backend
         working-directory: terraform/environments/${{ github.event.inputs.environment }}
         run: |
@@ -187,6 +256,7 @@ jobs:
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
             
+      # Convert comma-separated target list into Terraform target flags
       - name: Prepare target flags
         id: targets
         run: |
@@ -198,19 +268,24 @@ jobs:
           done
           echo "flags=$TARGET_FLAGS" >> $GITHUB_OUTPUT
           
+      # Generate plan for the targeted operation (apply or destroy)
       - name: Plan targeted operation
         working-directory: terraform/environments/${{ github.event.inputs.environment }}
         run: |
           if [ "${{ github.event.inputs.operation }}" = "target-destroy" ]; then
+            # Plan destruction of targeted resources
             terraform plan -destroy ${{ steps.targets.outputs.flags }} -out=target-plan
           else
+            # Plan application of targeted resources
             terraform plan ${{ steps.targets.outputs.flags }} -out=target-plan
           fi
           
+      # Execute the targeted operation (requires manual approval for production)
       - name: Apply targeted operation
         working-directory: terraform/environments/${{ github.event.inputs.environment }}
         run: terraform apply target-plan
         
+      # Notify team of successful targeted operation
       - name: Notify success
         if: success()
         uses: ./.github/actions/teams-notification
@@ -220,6 +295,7 @@ jobs:
           environment: ${{ github.event.inputs.environment }}
           message: "Target operation ${{ github.event.inputs.operation }} completed successfully for resources: ${{ github.event.inputs.target_resources }}"
           
+      # Alert team if targeted operation fails
       - name: Notify failure
         if: failure()
         uses: ./.github/actions/teams-notification

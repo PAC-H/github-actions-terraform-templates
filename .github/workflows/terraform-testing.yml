@@ -1,32 +1,62 @@
+# =============================================================================
+# TERRAFORM TESTING PIPELINE
+# =============================================================================
+# This workflow provides automated infrastructure testing using Terratest,
+# a Go testing framework specifically designed for testing infrastructure code.
+#
+# Testing Capabilities:
+# 1. BASIC TESTS: Simple resource validation and output verification
+# 2. INTEGRATION TESTS: End-to-end infrastructure testing
+# 3. ALL TESTS: Comprehensive test suite execution
+#
+# Key Features:
+# - Go-based infrastructure testing with Terratest
+# - Automated test execution on code changes
+# - Test result artifacts and reporting
+# - Environment-specific test execution
+# - Automatic cleanup of test resources
+# =============================================================================
+
 name: 'Terraform Testing'
 
+# =============================================================================
+# TRIGGERS: Manual execution + automatic testing on changes
+# =============================================================================
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # Manual execution with test suite selection
     inputs:
       test_suite:
         description: 'Test suite to run'
         required: true
         type: choice
         options:
-          - basic
-          - integration
-          - all
+          - basic       # Basic resource validation tests
+          - integration # End-to-end integration tests
+          - all         # Run complete test suite
       environment:
         description: 'Environment to test against'
         required: true
         type: choice
         options:
-          - staging
-          - production
+          - staging     # Run tests against staging environment
+          - production  # Run tests against production (use carefully!)
   push:
-    paths: ['tests/**', 'terraform/**']
+    paths: ['tests/**', 'terraform/**']  # Auto-trigger when test or Terraform files change
     branches: [develop, main]
 
+# =============================================================================
+# PERMISSIONS: Required for Azure access and test execution
+# =============================================================================
 permissions:
-  id-token: write
-  contents: read
+  id-token: write  # Required for OIDC authentication
+  contents: read   # Read repository contents and test files
 
 jobs:
+  # ===========================================================================
+  # CONFIGURATION LOADING JOB
+  # ===========================================================================
+  # Standard configuration loading for consistent environment settings
+  # ===========================================================================
   load-config:
     runs-on: self-hosted
     outputs:
@@ -36,12 +66,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      # Load shared configuration for Azure access and notifications
       - name: Load base config
         id: load-base
         run: |
           CONFIG=$(cat config/base.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
           
+      # Load environment-specific configurations for testing
       - name: Load staging config
         id: load-staging
         run: |
@@ -54,18 +86,29 @@ jobs:
           CONFIG=$(cat config/production.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
 
+  # ===========================================================================
+  # TERRAFORM TESTS JOB
+  # ===========================================================================
+  # Executes Go-based infrastructure tests using Terratest framework
+  # Tests deploy real infrastructure, validate it, then clean up
+  #
+  # IMPORTANT: These tests create real Azure resources and incur costs
+  # Always ensure proper cleanup and use staging environment for testing
+  # ===========================================================================
   terraform-tests:
     runs-on: self-hosted
     needs: load-config
-    environment: ${{ github.event.inputs.environment || 'staging' }}
+    environment: ${{ github.event.inputs.environment || 'staging' }}  # Requires approval for production testing
     steps:
       - uses: actions/checkout@v4
       
+      # Setup Go runtime for Terratest execution
       - name: Setup Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.21'
+          go-version: '1.21'  # Use Go version compatible with Terratest
           
+      # Setup Terraform for infrastructure deployment during tests
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
@@ -73,6 +116,7 @@ jobs:
           working_directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
           environment: ${{ github.event.inputs.environment || 'staging' }}
           
+      # Authenticate with Azure for test resource creation
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
@@ -80,40 +124,50 @@ jobs:
           subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
           client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
           
+      # Install Go dependencies for Terratest
       - name: Install Go dependencies
         working-directory: tests/terratest
         run: |
+          # Download all required Go modules
           go mod download
+          # Ensure go.mod and go.sum are properly synchronized
           go mod tidy
           
+      # Execute basic infrastructure validation tests
       - name: Run basic tests
         if: github.event.inputs.test_suite == 'basic' || github.event.inputs.test_suite == 'all' || github.event_name == 'push'
         working-directory: tests/terratest
         run: |
+          # Run basic test suite with extended timeout for Azure resource operations
           go test -v -timeout 30m -run TestTerraformBasicExample
           
+      # Execute comprehensive integration tests (if requested)
       - name: Run integration tests
         if: github.event.inputs.test_suite == 'integration' || github.event.inputs.test_suite == 'all'
         working-directory: tests/terratest
         run: |
           echo "Integration tests would run here"
           echo "Add your integration test functions to basic_test.go or create separate test files"
-          # go test -v -timeout 60m -run TestTerraformIntegration
+          # Example: go test -v -timeout 60m -run TestTerraformIntegration
           
+      # Generate JSON test results for analysis and reporting
       - name: Generate test report
-        if: always()
+        if: always()  # Generate report even if tests fail for debugging
         working-directory: tests/terratest
         run: |
+          # Generate machine-readable test results in JSON format
           go test -v -json > test-results.json || true
           
+      # Store test results as artifacts for review and debugging
       - name: Upload test results
-        if: always()
+        if: always()  # Always upload results for analysis
         uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ github.event.inputs.environment || 'staging' }}
           path: tests/terratest/test-results.json
           retention-days: 30
           
+      # Notify team of successful test completion
       - name: Notify test success
         if: success()
         uses: ./.github/actions/teams-notification
@@ -123,6 +177,7 @@ jobs:
           environment: ${{ github.event.inputs.environment || 'staging' }}
           message: "Terraform tests completed successfully for ${{ github.event.inputs.test_suite || 'basic' }} test suite"
           
+      # Alert team immediately if tests fail (may indicate infrastructure issues)
       - name: Notify test failure
         if: failure()
         uses: ./.github/actions/teams-notification

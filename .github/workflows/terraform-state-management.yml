@@ -1,16 +1,35 @@
+# =============================================================================
+# TERRAFORM STATE MANAGEMENT PIPELINE
+# =============================================================================
+# This workflow provides critical state management operations for Terraform:
+#
+# 1. UNLOCK OPERATION: Force-unlock stuck Terraform state files
+# 2. BACKUP OPERATION: Create timestamped backups of state files
+# 3. RESTORE OPERATION: Restore state files from previous backups
+#
+# CRITICAL SAFETY NOTES:
+# - These operations directly manipulate Terraform state files
+# - Improper use can cause data loss or infrastructure corruption
+# - Always ensure you have recent backups before performing operations
+# - Test restore operations in non-production environments first
+# =============================================================================
+
 name: 'Terraform State Management'
 
+# =============================================================================
+# TRIGGERS: Manual operations + automated weekly backups
+# =============================================================================
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # Manual execution with operation selection
     inputs:
       operation:
         description: 'State operation to perform'
         required: true
         type: choice
         options:
-          - unlock
-          - backup
-          - restore
+          - unlock    # Force unlock stuck state file
+          - backup    # Create manual backup of state files
+          - restore   # Restore state from backup
       environment:
         description: 'Environment'
         required: true
@@ -25,13 +44,22 @@ on:
         description: 'Backup name (required for restore operation)'
         required: false
   schedule:
-    - cron: '0 2 * * 0'  # Weekly backup on Sundays at 2 AM UTC
+    - cron: '0 2 * * 0'  # Weekly backup on Sundays at 2 AM UTC (off-peak hours)
 
+# =============================================================================
+# PERMISSIONS: Enhanced permissions needed for state operations
+# =============================================================================
 permissions:
-  id-token: write
-  contents: read
+  id-token: write  # Required for OIDC authentication
+  contents: read   # Read repository contents and configurations
 
 jobs:
+  # ===========================================================================
+  # CONFIGURATION LOADING JOB
+  # ===========================================================================
+  # Loads environment configurations and backup storage settings
+  # Critical for proper state file location and backup destinations
+  # ===========================================================================
   load-config:
     runs-on: self-hosted
     outputs:
@@ -41,12 +69,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
+      # Load base config containing backup storage account details
       - name: Load base config
         id: load-base
         run: |
           CONFIG=$(cat config/base.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
           
+      # Load environment-specific state storage configurations
       - name: Load staging config
         id: load-staging
         run: |
@@ -59,13 +89,24 @@ jobs:
           CONFIG=$(cat config/production.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
 
+  # ===========================================================================
+  # STATE OPERATION JOB
+  # ===========================================================================
+  # Performs the selected state management operation:
+  # - UNLOCK: Removes stuck locks (use lock_id from error messages)
+  # - BACKUP: Downloads current state and uploads to backup storage
+  # - RESTORE: Downloads backup and overwrites current state
+  #
+  # SAFETY: Uses GitHub environment protection for production operations
+  # ===========================================================================
   state-operation:
     runs-on: self-hosted
     needs: load-config
-    environment: ${{ github.event.inputs.environment || 'staging' }}
+    environment: ${{ github.event.inputs.environment || 'staging' }}  # Triggers approval for production
     steps:
       - uses: actions/checkout@v4
       
+      # Setup Terraform only for unlock operations (others use Azure CLI directly)
       - name: Setup Terraform
         if: github.event.inputs.operation == 'unlock'
         uses: ./.github/actions/setup-terraform
@@ -74,6 +115,7 @@ jobs:
           working_directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
           environment: ${{ github.event.inputs.environment || 'staging' }}
           
+      # Authenticate with Azure for all state storage operations
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
@@ -81,10 +123,12 @@ jobs:
           subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
           client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
           
+      # UNLOCK OPERATION: Force remove Terraform state lock
       - name: Unlock state
         if: github.event.inputs.operation == 'unlock'
         working-directory: terraform/environments/${{ github.event.inputs.environment }}
         run: |
+          # Initialize Terraform to access the locked state
           ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
           BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
           
@@ -94,15 +138,17 @@ jobs:
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
             
+          # Force unlock using the provided lock ID
           terraform force-unlock ${{ github.event.inputs.lock_id }}
           
+      # BACKUP OPERATION: Create timestamped backups of all state files
       - name: Backup state files
         if: github.event.inputs.operation == 'backup' || github.event_name == 'schedule'
         run: |
-          # Get current timestamp
+          # Create unique timestamp for this backup
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           
-          # Backup staging state
+          # Download and backup staging state file
           STAGING_CONFIG='${{ needs.load-config.outputs.staging-config }}'
           STAGING_BACKEND=$(echo $STAGING_CONFIG | jq -r '.terraform.backend')
           
@@ -112,7 +158,7 @@ jobs:
             --name $(echo $STAGING_BACKEND | jq -r '.key') \
             --file staging-${TIMESTAMP}.tfstate
             
-          # Backup production state
+          # Download and backup production state file
           PRODUCTION_CONFIG='${{ needs.load-config.outputs.production-config }}'
           PRODUCTION_BACKEND=$(echo $PRODUCTION_CONFIG | jq -r '.terraform.backend')
           
@@ -122,7 +168,7 @@ jobs:
             --name $(echo $PRODUCTION_BACKEND | jq -r '.key') \
             --file production-${TIMESTAMP}.tfstate
             
-          # Upload to backup storage
+          # Upload both backups to the designated backup storage account
           BASE_CONFIG='${{ needs.load-config.outputs.base-config }}'
           BACKUP_STORAGE=$(echo $BASE_CONFIG | jq -r '.storage')
           
@@ -138,10 +184,11 @@ jobs:
             --name production-${TIMESTAMP}.tfstate \
             --file production-${TIMESTAMP}.tfstate
             
+      # RESTORE OPERATION: Restore state file from backup (DANGEROUS!)
       - name: Restore state file
         if: github.event.inputs.operation == 'restore'
         run: |
-          # Download backup from backup storage
+          # Download the specified backup file
           BASE_CONFIG='${{ needs.load-config.outputs.base-config }}'
           BACKUP_STORAGE=$(echo $BASE_CONFIG | jq -r '.storage')
           
@@ -151,7 +198,7 @@ jobs:
             --name ${{ github.event.inputs.backup_name }} \
             --file restored.tfstate
             
-          # Upload to environment state storage
+          # Overwrite the current state file with the backup
           ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
           BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
           
@@ -162,6 +209,7 @@ jobs:
             --file restored.tfstate \
             --overwrite
             
+      # Notify team of successful state operation
       - name: Notify success
         if: success()
         uses: ./.github/actions/teams-notification
@@ -171,6 +219,7 @@ jobs:
           environment: ${{ github.event.inputs.environment || 'all' }}
           message: "State ${{ github.event.inputs.operation || 'backup' }} operation completed successfully"
           
+      # Critical: Alert team immediately if state operation fails
       - name: Notify failure
         if: failure()
         uses: ./.github/actions/teams-notification
