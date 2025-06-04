@@ -1,25 +1,31 @@
 {
-  "azure": {
-    "tenant_id": "# FILL: Your Azure Tenant ID",
-    "subscription_id": "# FILL: Your Azure Subscription ID",
-    "client_id": "# FILL: Your Azure Client ID for OIDC"
-  },
   "terraform": {
-    "version": "latest",
-    "azure_provider_version": "~>3.0"
-  },
-  "github": {
-    "self_hosted_agents": {
-      "staging_pool": "# FILL: Your staging agent pool name",
-      "production_pool": "# FILL: Your production agent pool name"
+    "version": "1.7.0",
+    "providers": {
+      "azurerm": {
+        "version": "~> 3.0"
+      }
+    },
+    "cache": {
+      "enabled": true,
+      "directory": ".terraform.d/plugin-cache"
     }
   },
   "notifications": {
-    "teams_webhook": "# FILL: Your Teams webhook URL"
+    "teams_webhook": "REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL"
   },
   "storage": {
-    "backup_account": "# FILL: Backup storage account name",
-    "backup_container": "# FILL: Backup container name",
-    "backup_resource_group": "# FILL: Backup resource group name"
+    "backup_account": "REPLACE_WITH_BACKUP_STORAGE_ACCOUNT",
+    "backup_container": "terraform-state-backups"
+  },
+  "runners": {
+    "type": "self-hosted",
+    "labels": ["self-hosted", "linux", "x64"]
+  },
+  "_comments": {
+    "azure_credentials": "Azure authentication credentials (tenant_id, subscription_id, client_id) are now managed via GitHub Secrets for enhanced security. Add these to your repository secrets: AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, AZURE_CLIENT_ID",
+    "teams_webhook": "Replace with your actual Teams channel webhook URL for notifications",
+    "backup_storage": "Replace with your actual Azure storage account name for state backups",
+    "terraform_cache": "Provider caching improves performance by avoiding repeated downloads"
   }
 } 

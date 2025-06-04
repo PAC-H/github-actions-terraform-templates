@@ -56,6 +56,7 @@ jobs:
   # CONFIGURATION LOADING JOB
   # ===========================================================================
   # Standard configuration loading for consistent environment settings
+  # Note: Azure authentication credentials are now managed via GitHub Secrets
   # ===========================================================================
   load-config:
     runs-on: self-hosted
@@ -66,7 +67,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      # Load shared configuration for Azure access and notifications
+      # Load shared configuration for notifications and Terraform versions
+      # Note: Azure credentials are now securely managed via GitHub Secrets
       - name: Load base config
         id: load-base
         run: |
@@ -116,13 +118,13 @@ jobs:
           working_directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
           environment: ${{ github.event.inputs.environment || 'staging' }}
           
-      # Authenticate with Azure for test resource creation
+      # Authenticate with Azure for test resource creation (using GitHub Secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
-          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
-          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
-          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
       # Install Go dependencies for Terratest
       - name: Install Go dependencies

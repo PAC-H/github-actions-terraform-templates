@@ -45,6 +45,7 @@ jobs:
   # ===========================================================================
   # Loads environment-specific configurations from JSON files and makes them
   # available to other jobs. This centralizes configuration management.
+  # Note: Azure authentication credentials are now managed via GitHub Secrets
   # ===========================================================================
   load-config:
     runs-on: self-hosted
@@ -55,7 +56,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      # Load shared configuration (Azure credentials, Teams webhook, etc.)
+      # Load shared configuration (Teams webhook, Terraform versions, etc.)
+      # Note: Azure credentials are now securely managed via GitHub Secrets
       - name: Load base config
         id: load-base
         run: |
@@ -102,13 +104,13 @@ jobs:
           working_directory: terraform/environments/${{ matrix.environment }}
           environment: ${{ matrix.environment }}
           
-      # Authenticate with Azure using OIDC (no stored credentials needed)
+      # Authenticate with Azure using OIDC (credentials from GitHub Secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
-          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
-          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
-          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
       # Ensure Terraform code follows formatting standards
       - name: Terraform Format Check
@@ -164,13 +166,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      # Authenticate with Azure to check policy compliance
+      # Authenticate with Azure to check policy compliance (using GitHub Secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
-          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
-          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
-          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
       # Check existing resources against Azure Policy definitions
       - name: Run Azure Policy Compliance Check
@@ -206,13 +208,13 @@ jobs:
           working_directory: terraform/environments/staging
           environment: staging
           
-      # Authenticate with Azure for deployment operations
+      # Authenticate with Azure for deployment operations (using GitHub Secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
-          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
-          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
-          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
       # Download the pre-generated plan from validation job
       - name: Download plan artifact
@@ -285,13 +287,13 @@ jobs:
           working_directory: terraform/environments/production
           environment: production
           
-      # Authenticate with Azure using production credentials
+      # Authenticate with Azure using production credentials (from GitHub Secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
-          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
-          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
-          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
       # Download the production plan generated during validation
       - name: Download plan artifact
