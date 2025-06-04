@@ -59,6 +59,7 @@ jobs:
   # CONFIGURATION LOADING JOB
   # ===========================================================================
   # Standard configuration loading for consistent environment settings
+  # Note: Azure authentication credentials are now managed via GitHub Secrets
   # ===========================================================================
   load-config:
     runs-on: self-hosted
@@ -69,7 +70,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      # Load shared configuration (Azure credentials, notification settings)
+      # Load shared configuration (notification settings, Terraform versions)
+      # Note: Azure credentials are now securely managed via GitHub Secrets
       - name: Load base config
         id: load-base
         run: |
@@ -169,18 +171,19 @@ jobs:
           working_directory: terraform/environments/${{ github.event.inputs.environment }}
           environment: ${{ github.event.inputs.environment }}
           
-      # Authenticate with Azure to access current state
+      # Authenticate with Azure to access current state (using GitHub Secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
-          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
-          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
-          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
       # Initialize Terraform to access state and generate accurate graph
       - name: Configure backend
         working-directory: terraform/environments/${{ github.event.inputs.environment }}
         run: |
+          # Initialize with environment-specific backend
           ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
           BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
           
@@ -235,13 +238,13 @@ jobs:
           working_directory: terraform/environments/${{ github.event.inputs.environment }}
           environment: ${{ github.event.inputs.environment }}
           
-      # Authenticate with Azure for resource operations
+      # Authenticate with Azure for resource operations (using GitHub Secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
-          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
-          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
-          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
       # Initialize Terraform backend for the target environment
       - name: Configure backend

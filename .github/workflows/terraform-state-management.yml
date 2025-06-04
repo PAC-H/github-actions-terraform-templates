@@ -59,6 +59,7 @@ jobs:
   # ===========================================================================
   # Loads environment configurations and backup storage settings
   # Critical for proper state file location and backup destinations
+  # Note: Azure authentication credentials are now managed via GitHub Secrets
   # ===========================================================================
   load-config:
     runs-on: self-hosted
@@ -69,7 +70,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      # Load base config containing backup storage account details
+      # Load base config containing backup storage account details and notification settings
+      # Note: Azure credentials are now securely managed via GitHub Secrets
       - name: Load base config
         id: load-base
         run: |
@@ -115,13 +117,13 @@ jobs:
           working_directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
           environment: ${{ github.event.inputs.environment || 'staging' }}
           
-      # Authenticate with Azure for all state storage operations
+      # Authenticate with Azure for all state storage operations (using GitHub Secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
-          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
-          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
-          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
       # UNLOCK OPERATION: Force remove Terraform state lock
       - name: Unlock state

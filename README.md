@@ -64,20 +64,45 @@ A comprehensive set of GitHub Actions workflows and Terraform templates for Azur
 2. Configure federated credentials for GitHub OIDC
 3. Assign appropriate Azure RBAC roles to the service principal
 
+#### GitHub Secrets Configuration
+
+**Security Note:** Azure authentication credentials are managed via GitHub Secrets for enhanced security. Never store sensitive credentials in configuration files.
+
+1. Go to your repository → Settings → Secrets and variables → Actions
+2. Add the following **Repository Secrets**:
+
+```
+AZURE_TENANT_ID          # Your Azure Tenant ID
+AZURE_SUBSCRIPTION_ID    # Your Azure Subscription ID  
+AZURE_CLIENT_ID          # Your Azure Client ID for OIDC
+```
+
+3. (Optional) Add the following secret for Teams notifications:
+```
+TEAMS_WEBHOOK_URL        # Your Microsoft Teams webhook URL
+```
+
 #### Repository Configuration
 
-1. Fill in the configuration files in the `config/` directory:
+Fill in the configuration files in the `config/` directory:
 
 **config/base.json:**
 ```json
 {
-  "azure": {
-    "tenant_id": "your-tenant-id",
-    "subscription_id": "your-subscription-id", 
-    "client_id": "your-client-id"
+  "terraform": {
+    "version": "1.7.0",
+    "providers": {
+      "azurerm": {
+        "version": "~> 3.0"
+      }
+    }
   },
   "notifications": {
-    "teams_webhook": "your-teams-webhook-url"
+    "teams_webhook": "REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL"
+  },
+  "storage": {
+    "backup_account": "REPLACE_WITH_BACKUP_STORAGE_ACCOUNT",
+    "backup_container": "terraform-state-backups"
   }
 }
 ```
@@ -89,16 +114,24 @@ A comprehensive set of GitHub Actions workflows and Terraform templates for Azur
     "backend": {
       "storage_account_name": "your-state-storage-account",
       "container_name": "your-state-container",
-      "resource_group_name": "your-state-resource-group"
+      "resource_group_name": "your-state-resource-group",
+      "key": "terraform.tfstate"
     }
+  },
+  "deployment": {
+    "auto_approve": false,
+    "notification_enabled": true
   }
 }
 ```
 
-2. Set up GitHub Environment Protection Rules:
+#### GitHub Environment Protection
+
+Set up GitHub Environment Protection Rules for approval gates:
    - Go to Settings → Environments
    - Create `staging` and `production` environments
    - Configure required reviewers and deployment branches
+   - Set environment-specific secrets if needed
 
 ### 3. Workflows Overview
 
@@ -108,12 +141,12 @@ A comprehensive set of GitHub Actions workflows and Terraform templates for Azur
 - **Flow:** Validation → Compliance → Staging → Production
 
 #### Drift Detection (`terraform-drift-detection.yml`)
-- **Schedule:** Weekly on Sundays
+- **Schedule:** Weekly on Sundays at 9 AM UTC
 - **Purpose:** Detect infrastructure drift and generate reports
 
 #### State Management (`terraform-state-management.yml`)
 - **Operations:** Unlock, backup, restore state files
-- **Schedule:** Weekly automated backups
+- **Schedule:** Weekly automated backups on Sundays at 2 AM UTC
 
 #### Utilities (`terraform-utilities.yml`)
 - **Operations:** tfupdate, dependency graphs, targeted apply/destroy
@@ -166,7 +199,7 @@ git push origin develop
 ```yaml
 - uses: ./.github/actions/setup-terraform
   with:
-    terraform_version: latest
+    terraform_version: 1.7.0
     working_directory: terraform/environments/staging
     environment: staging
 ```
@@ -184,13 +217,18 @@ git push origin develop
 ```yaml
 - uses: ./.github/actions/teams-notification
   with:
-    webhook_url: ${{ secrets.TEAMS_WEBHOOK }}
+    webhook_url: ${{ secrets.TEAMS_WEBHOOK_URL }}
     status: success
     environment: production
     message: "Deployment completed successfully"
 ```
 
 ## Security Considerations
+
+### Authentication & Authorization
+- **Azure OIDC:** All authentication uses OIDC tokens - no stored credentials
+- **GitHub Secrets:** Sensitive data encrypted and managed by GitHub
+- **Principle of Least Privilege:** Service principals have minimal required permissions
 
 ### RBAC Configuration
 - **Staging Environment:** Contributor role on staging resource groups
@@ -203,14 +241,22 @@ git push origin develop
 - Required status checks for all workflows
 - Restrict push access to authorized users
 - Enable signed commits (recommended)
+- Environment protection rules with manual approvals
+
+### Secret Management Best Practices
+- Use GitHub repository secrets for sensitive data
+- Rotate credentials regularly
+- Audit secret access and usage
+- Use environment-specific secrets when needed
 
 ## Troubleshooting
 
 ### Common Issues
 
 1. **Authentication Failures**
-   - Verify OIDC configuration in Azure AD
-   - Check federated credential subject claims
+   - Verify GitHub Secrets are correctly set: `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`, `AZURE_CLIENT_ID`
+   - Check OIDC configuration in Azure AD
+   - Verify federated credential subject claims
    - Ensure service principal has appropriate roles
 
 2. **State Lock Issues**
@@ -223,11 +269,25 @@ git push origin develop
    - Lock file modifications
    - Clear cache and re-run workflow
 
+4. **Secret Access Issues**
+   - Verify secrets are defined at repository level
+   - Check if environment-specific secrets are needed
+   - Ensure proper secret naming (case-sensitive)
+
 ### Debugging
 
 Enable debug logging by setting repository secrets:
 - `ACTIONS_STEP_DEBUG=true`
 - `ACTIONS_RUNNER_DEBUG=true`
+
+### Validation Steps
+
+Before running workflows, verify:
+1. All required GitHub Secrets are configured
+2. Azure OIDC federated credentials are properly set up
+3. Service principal has necessary Azure RBAC roles
+4. GitHub environments are configured with protection rules
+5. Configuration files contain valid values (no placeholder text)
 
 ## Contributing
 

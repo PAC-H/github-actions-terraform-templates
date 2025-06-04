@@ -36,6 +36,7 @@ jobs:
   # ===========================================================================
   # Same configuration loading pattern as main deployment workflow
   # to ensure consistent environment settings across all pipelines
+  # Note: Azure authentication credentials are now managed via GitHub Secrets
   # ===========================================================================
   load-config:
     runs-on: self-hosted
@@ -46,7 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      # Load shared configuration (Azure credentials, notification settings)
+      # Load shared configuration (notification settings, Terraform versions)
+      # Note: Azure credentials are now securely managed via GitHub Secrets
       - name: Load base config
         id: load-base
         run: |
@@ -90,13 +92,13 @@ jobs:
           working_directory: terraform/environments/${{ matrix.environment }}
           environment: ${{ matrix.environment }}
           
-      # Authenticate with Azure to access current resource state
+      # Authenticate with Azure to access current resource state (using GitHub Secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
-          tenant_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.tenant_id }}
-          subscription_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.subscription_id }}
-          client_id: ${{ fromJson(needs.load-config.outputs.base-config).azure.client_id }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
       # Initialize Terraform with the appropriate backend for this environment
       - name: Configure backend
