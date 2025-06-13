@@ -11,6 +11,7 @@ A comprehensive set of GitHub Actions workflows and Terraform templates for Azur
 - 🧪 **Infrastructure Testing** - Terratest integration for automated testing
 - 📊 **Drift Detection** - Weekly automated drift detection
 - 🔧 **Utility Operations** - State management, dependency graphs, targeted operations
+- 📥 **Import Operations** - Comprehensive resource import with safety measures
 - 📢 **Teams Notifications** - Integrated Microsoft Teams webhook notifications
 - ⚡ **Performance Optimized** - Terraform provider caching and parallel execution
 
@@ -23,7 +24,7 @@ A comprehensive set of GitHub Actions workflows and Terraform templates for Azur
 │   │   ├── terraform-main.yml           # Main deployment pipeline
 │   │   ├── terraform-drift-detection.yml
 │   │   ├── terraform-state-management.yml
-│   │   ├── terraform-utilities.yml
+│   │   ├── terraform-utilities.yml      # Includes import operations
 │   │   ├── terraform-compliance.yml
 │   │   └── terraform-testing.yml
 │   └── actions/                   # Reusable GitHub Actions
@@ -34,7 +35,10 @@ A comprehensive set of GitHub Actions workflows and Terraform templates for Azur
 ├── config/                        # Environment configurations
 │   ├── base.json                  # Shared configuration
 │   ├── staging.json               # Staging-specific config
-│   └── production.json            # Production-specific config
+│   ├── production.json            # Production-specific config
+│   └── imports/                   # Import configuration files
+│       ├── staging-imports.json       # Bulk import config for staging
+│       └── production-imports.json    # Bulk import config for production
 ├── terraform/
 │   ├── environments/              # Environment-specific deployments
 │   │   ├── staging/
@@ -79,8 +83,10 @@ AZURE_CLIENT_ID          # Your Azure Client ID for OIDC
 
 3. (Optional) Add the following secret for Teams notifications:
 ```
-TEAMS_WEBHOOK_URL        # Your Microsoft Teams webhook URL
+TEAMS_WEBHOOK_URL        # Your Microsoft Teams webhook URL (optional)
 ```
+
+**Note:** Teams notifications are optional. If no webhook URL is configured in `base.json`, notification steps will be skipped and workflows will run normally.
 
 #### Repository Configuration
 
@@ -106,6 +112,8 @@ Fill in the configuration files in the `config/` directory:
   }
 }
 ```
+
+**Teams Notifications:** Replace `teams_webhook` with your actual Teams webhook URL, or leave as placeholder to disable notifications.
 
 **config/staging.json & config/production.json:**
 ```json
@@ -149,7 +157,9 @@ Set up GitHub Environment Protection Rules for approval gates:
 - **Schedule:** Weekly automated backups on Sundays at 2 AM UTC
 
 #### Utilities (`terraform-utilities.yml`)
-- **Operations:** tfupdate, dependency graphs, targeted apply/destroy
+- **Operations:** tfupdate, dependency graphs, targeted apply/destroy, import operations
+- **Import Types:** Individual resource import, bulk import, dry-run validation
+- **Safety Features:** State backup, validation, approval gates
 - **Triggers:** Manual dispatch, terraform file changes
 
 #### Compliance (`terraform-compliance.yml`)
@@ -175,6 +185,28 @@ git push origin develop
 ```bash
 # Manually trigger drift detection
 # Go to Actions → Terraform Drift Detection → Run workflow
+```
+
+### Import Existing Resources
+```bash
+# Import individual resource
+# Go to Actions → Terraform Utilities → Run workflow
+# Operation: import-individual
+# Environment: staging
+# Resource Address: azurerm_resource_group.main
+# Resource ID: /subscriptions/12345.../resourceGroups/my-rg
+
+# Import multiple resources from config file
+# Go to Actions → Terraform Utilities → Run workflow
+# Operation: import-bulk
+# Environment: staging
+# Import Config File: config/imports/staging-imports.json
+
+# Dry-run to validate imports before execution
+# Go to Actions → Terraform Utilities → Run workflow
+# Operation: import-dry-run
+# Environment: staging
+# (specify individual or bulk import parameters)
 ```
 
 ### Perform Targeted Operations
@@ -274,6 +306,12 @@ git push origin develop
    - Check if environment-specific secrets are needed
    - Ensure proper secret naming (case-sensitive)
 
+5. **Teams Notification Issues**
+   - Teams notifications are **optional** - workflows will run without them
+   - If `teams_webhook` is set to placeholder value or empty, notification steps are skipped
+   - To enable: Replace placeholder in `base.json` with actual Teams webhook URL
+   - To disable: Leave `teams_webhook` as `"REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL"` or empty string
+
 ### Debugging
 
 Enable debug logging by setting repository secrets:
@@ -307,3 +345,210 @@ For issues and questions:
 - Create GitHub Issues for bugs and feature requests
 - Check the troubleshooting section
 - Review workflow run logs for detailed error messages 
+
+## Import Operations
+
+### Overview
+
+The import functionality allows you to bring existing Azure resources under Terraform management with comprehensive safety measures:
+
+- **Individual Imports:** Import single resources via workflow inputs
+- **Bulk Imports:** Import multiple resources from configuration files
+- **Dry-Run Mode:** Validate imports before execution
+- **State Backup:** Automatic backup before any import operation
+- **Verification:** State integrity checks after import
+- **Approval Gates:** Production imports require manual approval
+
+### Import Configuration
+
+#### Individual Import
+
+For single resource imports, provide:
+- **Resource Address:** Terraform resource identifier (e.g., `azurerm_resource_group.main`)
+- **Resource ID:** Full Azure resource ID (e.g., `/subscriptions/.../resourceGroups/my-rg`)
+
+#### Bulk Import Configuration
+
+Create import configuration files in `config/imports/`:
+
+**config/imports/staging-imports.json:**
+```json
+{
+  "description": "Bulk import configuration for staging environment",
+  "environment": "staging",
+  "imports": [
+    {
+      "resource_address": "azurerm_resource_group.main",
+      "resource_id": "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-staging-example",
+      "description": "Main resource group for staging environment"
+    },
+    {
+      "resource_address": "azurerm_storage_account.state",
+      "resource_id": "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-staging-tfstate/providers/Microsoft.Storage/storageAccounts/stagingstatestg",
+      "description": "Terraform state storage account"
+    }
+  ]
+}
+```
+
+### Import Workflow Operations
+
+#### 1. import-individual
+Import a single Azure resource into Terraform state:
+- **Required Inputs:** `import_resource_address`, `import_resource_id`
+- **Safety:** Automatic state backup, validation, verification
+- **Approval:** Required for production environment
+
+#### 2. import-bulk
+Import multiple resources from a configuration file:
+- **Required Input:** `import_config_file`
+- **Features:** Batch processing, skip existing resources, progress tracking
+- **Safety:** Comprehensive validation, state backup, failure handling
+
+#### 3. import-dry-run
+Validate import operations without making changes:
+- **Purpose:** Test import configuration, verify resource existence
+- **Output:** Detailed validation report, import readiness assessment
+- **Safety:** No state modifications, read-only validation
+
+### Import Safety Features
+
+#### State Backup
+- **Automatic:** Created before any import operation (except dry-run)
+- **Retention:** 90 days for recovery purposes
+- **Format:** Timestamped state files
+- **Storage:** GitHub Actions artifacts
+
+#### Validation
+- **Resource Existence:** Verify Azure resources exist and are accessible
+- **State Conflicts:** Check if resources already exist in Terraform state
+- **Configuration:** Validate JSON format and required fields
+- **Permissions:** Ensure proper Azure RBAC permissions
+
+#### Verification
+- **Post-Import:** State integrity checks after import
+- **Configuration Drift:** Detect any required configuration updates
+- **Plan Generation:** Create plan showing necessary changes
+- **Reporting:** Comprehensive import operation reports
+
+### Usage Examples
+
+#### Import Individual Resource
+```bash
+# Manual workflow dispatch
+1. Go to Actions → Terraform Utilities
+2. Click "Run workflow"
+3. Select:
+   - Operation: import-individual
+   - Environment: staging
+   - Resource Address: azurerm_resource_group.main
+   - Resource ID: /subscriptions/12345.../resourceGroups/my-rg
+4. Click "Run workflow"
+```
+
+#### Import Bulk Resources
+```bash
+# Manual workflow dispatch
+1. Create/update config/imports/staging-imports.json
+2. Go to Actions → Terraform Utilities
+3. Click "Run workflow"
+4. Select:
+   - Operation: import-bulk
+   - Environment: staging
+   - Import Config File: config/imports/staging-imports.json
+5. Click "Run workflow"
+```
+
+#### Validate Import (Dry-Run)
+```bash
+# Test before actual import
+1. Go to Actions → Terraform Utilities
+2. Click "Run workflow"
+3. Select:
+   - Operation: import-dry-run
+   - Environment: staging
+   - (provide individual or bulk import parameters)
+4. Review validation report in artifacts
+```
+
+### Getting Azure Resource IDs
+
+Find Azure resource IDs using:
+
+#### Azure Portal
+1. Navigate to your resource
+2. Go to Properties
+3. Copy the "Resource ID" field
+
+#### Azure CLI
+```bash
+# Resource Group
+az group show --name "my-resource-group" --query id --output tsv
+
+# Storage Account
+az storage account show --name "mystorageaccount" --resource-group "my-rg" --query id --output tsv
+
+# Virtual Network
+az network vnet show --name "my-vnet" --resource-group "my-rg" --query id --output tsv
+```
+
+#### PowerShell
+```powershell
+# Resource Group
+(Get-AzResourceGroup -Name "my-resource-group").ResourceId
+
+# Storage Account
+(Get-AzStorageAccount -ResourceGroupName "my-rg" -Name "mystorageaccount").Id
+```
+
+### Best Practices
+
+#### Before Import
+1. **Backup State:** Always ensured automatically by the workflow
+2. **Dry-Run First:** Use import-dry-run to validate before actual import
+3. **Resource Mapping:** Ensure Terraform resource addresses match your configuration
+4. **Permissions:** Verify Azure RBAC permissions for resource access
+
+#### During Import
+1. **Monitor Logs:** Watch workflow execution for any issues
+2. **Review Reports:** Check validation and operation reports
+3. **Handle Failures:** Address any failed imports individually
+
+#### After Import
+1. **Review Drift:** Check post-import plan for required configuration updates
+2. **Update Configuration:** Modify Terraform files to match imported resource settings
+3. **Test Changes:** Run terraform plan to ensure configuration alignment
+4. **Documentation:** Update documentation with imported resources
+
+### Troubleshooting Import Issues
+
+#### Common Issues
+
+1. **Resource Already in State**
+   - **Error:** Resource already exists in Terraform state
+   - **Solution:** Use terraform state list to check existing resources
+   - **Prevention:** Run dry-run validation first
+
+2. **Resource Not Found**
+   - **Error:** Azure resource not found or not accessible
+   - **Solution:** Verify resource ID and Azure permissions
+   - **Check:** Ensure resource exists and is in correct subscription
+
+3. **Permission Denied**
+   - **Error:** Insufficient permissions to access resource
+   - **Solution:** Verify service principal has appropriate RBAC roles
+   - **Required:** At minimum Reader role on resources to import
+
+4. **Invalid Resource Address**
+   - **Error:** Terraform resource address doesn't match configuration
+   - **Solution:** Ensure resource address matches your .tf files exactly
+   - **Check:** Verify module paths and resource naming
+
+#### Recovery Procedures
+
+If import operations fail:
+
+1. **State Recovery:** Download state backup from workflow artifacts
+2. **Manual Restoration:** Use state management workflow to restore if needed
+3. **Retry Import:** Fix issues and retry import operation
+4. **Support:** Review workflow logs and create GitHub issue if needed 

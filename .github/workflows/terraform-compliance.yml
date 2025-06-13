@@ -252,6 +252,7 @@ jobs:
             
       # Notify team of compliance check completion
       - name: Notify compliance results
+        if: fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}

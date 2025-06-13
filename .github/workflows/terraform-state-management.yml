@@ -213,7 +213,7 @@ jobs:
             
       # Notify team of successful state operation
       - name: Notify success
-        if: success()
+        if: success() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -223,7 +223,7 @@ jobs:
           
       # Critical: Alert team immediately if state operation fails
       - name: Notify failure
-        if: failure()
+        if: failure() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}

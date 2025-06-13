@@ -1,0 +1,27 @@
+{
+  "description": "Bulk import configuration for staging environment",
+  "environment": "staging",
+  "imports": [
+    {
+      "resource_address": "azurerm_resource_group.main",
+      "resource_id": "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-staging-example",
+      "description": "Main resource group for staging environment"
+    },
+    {
+      "resource_address": "azurerm_storage_account.state",
+      "resource_id": "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-staging-tfstate/providers/Microsoft.Storage/storageAccounts/stagingstatestg",
+      "description": "Terraform state storage account"
+    },
+    {
+      "resource_address": "azurerm_virtual_network.main",
+      "resource_id": "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg-staging-network/providers/Microsoft.Network/virtualNetworks/vnet-staging",
+      "description": "Main virtual network for staging"
+    }
+  ],
+  "_instructions": {
+    "usage": "This file defines multiple Azure resources to import into Terraform state",
+    "resource_address": "The Terraform resource address (must match your .tf files)",
+    "resource_id": "The full Azure resource ID (can be found in Azure Portal)",
+    "workflow_usage": "Use this file path in the import_config_file input when running import-bulk operation"
+  }
+} 
