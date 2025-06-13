@@ -6,11 +6,13 @@
 # 1. TFUPDATE: Automatically update Terraform provider versions
 # 2. DEPENDENCY GRAPH: Generate visual dependency graphs of resources
 # 3. TARGET OPERATIONS: Apply/destroy specific resources safely
+# 4. IMPORT OPERATIONS: Import existing Azure resources into Terraform state
 #
 # Key Features:
 # - Automated provider updates with PR creation
 # - Visual dependency mapping for troubleshooting
 # - Surgical infrastructure changes via targeting
+# - Comprehensive import functionality with safety measures
 # - Parallel execution for efficiency
 # - Smart triggering based on file changes
 # =============================================================================
@@ -32,6 +34,9 @@ on:
           - dependency-graph # Generate resource dependency graph
           - target-apply    # Apply changes to specific resources only
           - target-destroy  # Destroy specific resources only
+          - import-individual # Import individual resource into state
+          - import-bulk     # Import multiple resources from configuration
+          - import-dry-run  # Dry-run import to show what would be imported
       environment:
         description: 'Environment'
         required: true
@@ -41,6 +46,15 @@ on:
           - production
       target_resources:
         description: 'Target resources (comma-separated, required for target operations)'
+        required: false
+      import_resource_address:
+        description: 'Terraform resource address (e.g., azurerm_resource_group.example)'
+        required: false
+      import_resource_id:
+        description: 'Azure resource ID to import (e.g., /subscriptions/.../resourceGroups/rg-name)'
+        required: false
+      import_config_file:
+        description: 'Import configuration file path (e.g., config/imports/staging-imports.json)'
         required: false
   push:
     paths: ['terraform/**']        # Auto-trigger tfupdate when Terraform files change
@@ -210,6 +224,382 @@ jobs:
             terraform/environments/${{ github.event.inputs.environment }}/dependency-graph-${{ github.event.inputs.environment }}.svg
             terraform/environments/${{ github.event.inputs.environment }}/dependency-graph-${{ github.event.inputs.environment }}.png
           retention-days: 30
+
+  # ===========================================================================
+  # IMPORT OPERATIONS JOB
+  # ===========================================================================
+  # Performs Terraform import operations with comprehensive safety measures:
+  # - Individual resource imports via workflow inputs
+  # - Bulk imports from configuration files
+  # - Dry-run mode to validate imports before execution
+  # - Automatic state backup before import
+  # - State verification after import
+  #
+  # SAFETY: Requires environment approval for production operations
+  # ===========================================================================
+  import-operations:
+    if: |
+      github.event.inputs.operation == 'import-individual' || 
+      github.event.inputs.operation == 'import-bulk' || 
+      github.event.inputs.operation == 'import-dry-run'
+    runs-on: self-hosted
+    needs: load-config
+    environment: ${{ github.event.inputs.environment }}  # Triggers approval for production
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Setup Terraform for import operations
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/${{ github.event.inputs.environment }}
+          environment: ${{ github.event.inputs.environment }}
+          
+      # Authenticate with Azure for resource operations (using GitHub Secrets)
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          
+      # Initialize Terraform backend for the target environment
+      - name: Configure backend
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      # Create state backup before any import operations
+      - name: Create state backup
+        if: github.event.inputs.operation != 'import-dry-run'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          # Create timestamped backup
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          BACKUP_NAME="state-backup-before-import-${TIMESTAMP}.tfstate"
+          
+          # Download current state
+          terraform state pull > $BACKUP_NAME
+          
+          echo "BACKUP_NAME=$BACKUP_NAME" >> $GITHUB_ENV
+          echo "Created state backup: $BACKUP_NAME"
+          
+      # Upload state backup as artifact for recovery purposes
+      - name: Upload state backup
+        if: github.event.inputs.operation != 'import-dry-run'
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-backup-${{ github.event.inputs.environment }}-${{ github.run_number }}
+          path: terraform/environments/${{ github.event.inputs.environment }}/${{ env.BACKUP_NAME }}
+          retention-days: 90  # Keep backups longer for recovery purposes
+          
+      # Validate individual import parameters
+      - name: Validate individual import inputs
+        if: github.event.inputs.operation == 'import-individual'
+        run: |
+          if [ -z "${{ github.event.inputs.import_resource_address }}" ] || [ -z "${{ github.event.inputs.import_resource_id }}" ]; then
+            echo "❌ Error: Both import_resource_address and import_resource_id are required for individual imports"
+            echo "Example:"
+            echo "  Resource Address: azurerm_resource_group.main"
+            echo "  Resource ID: /subscriptions/12345.../resourceGroups/my-rg"
+            exit 1
+          fi
+          
+      # Validate bulk import configuration file
+      - name: Validate bulk import config
+        if: github.event.inputs.operation == 'import-bulk'
+        run: |
+          CONFIG_FILE="${{ github.event.inputs.import_config_file }}"
+          if [ -z "$CONFIG_FILE" ]; then
+            echo "❌ Error: import_config_file is required for bulk imports"
+            exit 1
+          fi
+          
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "❌ Error: Import configuration file not found: $CONFIG_FILE"
+            echo "Please create the configuration file with the following format:"
+            echo '{
+              "imports": [
+                {
+                  "resource_address": "azurerm_resource_group.main",
+                  "resource_id": "/subscriptions/.../resourceGroups/my-rg"
+                }
+              ]
+            }'
+            exit 1
+          fi
+          
+          # Validate JSON format
+          if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
+            echo "❌ Error: Invalid JSON format in $CONFIG_FILE"
+            exit 1
+          fi
+          
+      # Perform dry-run validation for all import types
+      - name: Import dry-run validation
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          echo "🔍 Performing import dry-run validation..."
+          
+          # Create import validation report
+          REPORT_FILE="import-validation-report.md"
+          cat > $REPORT_FILE << EOF
+          # Import Validation Report - ${{ github.event.inputs.environment }}
+          
+          **Operation**: ${{ github.event.inputs.operation }}
+          **Environment**: ${{ github.event.inputs.environment }}
+          **Timestamp**: $(date)
+          
+          ## Import Plan
+          
+          EOF
+          
+          if [ "${{ github.event.inputs.operation }}" = "import-individual" ]; then
+            # Individual import validation
+            RESOURCE_ADDRESS="${{ github.event.inputs.import_resource_address }}"
+            RESOURCE_ID="${{ github.event.inputs.import_resource_id }}"
+            
+            echo "### Individual Import" >> $REPORT_FILE
+            echo "- **Resource Address**: \`$RESOURCE_ADDRESS\`" >> $REPORT_FILE
+            echo "- **Azure Resource ID**: \`$RESOURCE_ID\`" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            
+            # Check if resource already exists in state
+            if terraform state show "$RESOURCE_ADDRESS" >/dev/null 2>&1; then
+              echo "⚠️ **Warning**: Resource $RESOURCE_ADDRESS already exists in state" >> $REPORT_FILE
+              echo "❌ Import cannot proceed - resource already managed by Terraform"
+              exit 1
+            else
+              echo "✅ **Status**: Resource not in state, import can proceed" >> $REPORT_FILE
+            fi
+            
+            # Verify Azure resource exists
+            echo "🔍 Verifying Azure resource exists..."
+            if az resource show --ids "$RESOURCE_ID" >/dev/null 2>&1; then
+              echo "✅ **Azure Resource**: Exists and accessible" >> $REPORT_FILE
+            else
+              echo "❌ **Azure Resource**: Not found or not accessible" >> $REPORT_FILE
+              echo "❌ Import cannot proceed - Azure resource not found"
+              exit 1
+            fi
+            
+          elif [ "${{ github.event.inputs.operation }}" = "import-bulk" ]; then
+            # Bulk import validation
+            CONFIG_FILE="${{ github.event.inputs.import_config_file }}"
+            
+            echo "### Bulk Import" >> $REPORT_FILE
+            echo "- **Configuration File**: \`$CONFIG_FILE\`" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            
+            # Parse and validate each import
+            IMPORT_COUNT=$(jq '.imports | length' "$CONFIG_FILE")
+            echo "- **Total Imports**: $IMPORT_COUNT" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            
+            for i in $(seq 0 $(($IMPORT_COUNT - 1))); do
+              RESOURCE_ADDRESS=$(jq -r ".imports[$i].resource_address" "$CONFIG_FILE")
+              RESOURCE_ID=$(jq -r ".imports[$i].resource_id" "$CONFIG_FILE")
+              
+              echo "#### Import $((i + 1)): $RESOURCE_ADDRESS" >> $REPORT_FILE
+              
+              # Check if resource already exists in state
+              if terraform state show "$RESOURCE_ADDRESS" >/dev/null 2>&1; then
+                echo "⚠️ **Warning**: Already in state - will skip" >> $REPORT_FILE
+              else
+                # Verify Azure resource exists
+                if az resource show --ids "$RESOURCE_ID" >/dev/null 2>&1; then
+                  echo "✅ **Status**: Ready for import" >> $REPORT_FILE
+                else
+                  echo "❌ **Status**: Azure resource not found" >> $REPORT_FILE
+                fi
+              fi
+              echo "" >> $REPORT_FILE
+            done
+          fi
+          
+          echo "📋 Import validation completed. See report for details."
+          
+      # Execute individual resource import
+      - name: Execute individual import
+        if: github.event.inputs.operation == 'import-individual'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          RESOURCE_ADDRESS="${{ github.event.inputs.import_resource_address }}"
+          RESOURCE_ID="${{ github.event.inputs.import_resource_id }}"
+          
+          echo "🚀 Importing resource: $RESOURCE_ADDRESS"
+          echo "📍 Azure Resource ID: $RESOURCE_ID"
+          
+          # Perform the import
+          terraform import "$RESOURCE_ADDRESS" "$RESOURCE_ID"
+          
+          echo "✅ Import completed successfully"
+          
+      # Execute bulk resource imports
+      - name: Execute bulk imports
+        if: github.event.inputs.operation == 'import-bulk'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          CONFIG_FILE="${{ github.event.inputs.import_config_file }}"
+          
+          echo "🚀 Starting bulk import from: $CONFIG_FILE"
+          
+          # Parse and execute each import
+          IMPORT_COUNT=$(jq '.imports | length' "$CONFIG_FILE")
+          SUCCESSFUL_IMPORTS=0
+          FAILED_IMPORTS=0
+          
+          for i in $(seq 0 $(($IMPORT_COUNT - 1))); do
+            RESOURCE_ADDRESS=$(jq -r ".imports[$i].resource_address" "$CONFIG_FILE")
+            RESOURCE_ID=$(jq -r ".imports[$i].resource_id" "$CONFIG_FILE")
+            
+            echo "📦 Importing $((i + 1))/$IMPORT_COUNT: $RESOURCE_ADDRESS"
+            
+            # Check if already in state (skip if exists)
+            if terraform state show "$RESOURCE_ADDRESS" >/dev/null 2>&1; then
+              echo "⏭️ Skipping - already in state"
+              continue
+            fi
+            
+            # Attempt import
+            if terraform import "$RESOURCE_ADDRESS" "$RESOURCE_ID"; then
+              echo "✅ Successfully imported: $RESOURCE_ADDRESS"
+              SUCCESSFUL_IMPORTS=$((SUCCESSFUL_IMPORTS + 1))
+            else
+              echo "❌ Failed to import: $RESOURCE_ADDRESS"
+              FAILED_IMPORTS=$((FAILED_IMPORTS + 1))
+            fi
+            echo ""
+          done
+          
+          echo "📊 Bulk import summary:"
+          echo "✅ Successful: $SUCCESSFUL_IMPORTS"
+          echo "❌ Failed: $FAILED_IMPORTS"
+          echo "📝 Total processed: $IMPORT_COUNT"
+          
+          if [ $FAILED_IMPORTS -gt 0 ]; then
+            echo "⚠️ Some imports failed. Please review the logs above."
+            exit 1
+          fi
+          
+      # Verify state integrity after import
+      - name: Verify state after import
+        if: github.event.inputs.operation != 'import-dry-run'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          echo "🔍 Verifying Terraform state integrity after import..."
+          
+          # Refresh state to ensure it's current
+          terraform refresh
+          
+          # Validate configuration against current state
+          terraform validate
+          
+          # Check for any configuration drift
+          terraform plan -detailed-exitcode -out=post-import-plan
+          PLAN_EXIT_CODE=$?
+          
+          if [ $PLAN_EXIT_CODE -eq 0 ]; then
+            echo "✅ State verification successful - no configuration drift detected"
+          elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+            echo "⚠️ Configuration drift detected after import"
+            echo "This is normal - imported resources may need configuration updates"
+            echo "📄 Plan saved as post-import-plan for review"
+          else
+            echo "❌ State verification failed"
+            exit 1
+          fi
+          
+      # Generate comprehensive import report
+      - name: Generate import report
+        if: always()
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          REPORT_FILE="import-operation-report.md"
+          
+          cat > $REPORT_FILE << EOF
+          # Terraform Import Report
+          
+          **Operation**: ${{ github.event.inputs.operation }}
+          **Environment**: ${{ github.event.inputs.environment }}
+          **Execution Time**: $(date)
+          **Workflow Run**: ${{ github.run_number }}
+          
+          ## Operation Details
+          
+          EOF
+          
+          if [ "${{ github.event.inputs.operation }}" = "import-individual" ]; then
+            cat >> $REPORT_FILE << EOF
+          ### Individual Import
+          - **Resource Address**: \`${{ github.event.inputs.import_resource_address }}\`
+          - **Azure Resource ID**: \`${{ github.event.inputs.import_resource_id }}\`
+          EOF
+          elif [ "${{ github.event.inputs.operation }}" = "import-bulk" ]; then
+            cat >> $REPORT_FILE << EOF
+          ### Bulk Import
+          - **Configuration File**: \`${{ github.event.inputs.import_config_file }}\`
+          EOF
+          fi
+          
+          cat >> $REPORT_FILE << EOF
+          
+          ## State Information
+          - **State Backup**: ${{ env.BACKUP_NAME || 'N/A (dry-run)' }}
+          - **Environment**: ${{ github.event.inputs.environment }}
+          
+          ## Files Generated
+          - Import validation report
+          - Import operation report
+          EOF
+          
+          if [ -f "post-import-plan" ]; then
+            cat >> $REPORT_FILE << EOF
+          - Post-import Terraform plan
+          EOF
+          fi
+          
+          echo "📄 Import report generated"
+          
+      # Upload all import artifacts
+      - name: Upload import artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: import-operation-${{ github.event.inputs.environment }}-${{ github.run_number }}
+          path: |
+            terraform/environments/${{ github.event.inputs.environment }}/import-validation-report.md
+            terraform/environments/${{ github.event.inputs.environment }}/import-operation-report.md
+            terraform/environments/${{ github.event.inputs.environment }}/post-import-plan
+          retention-days: 30
+          
+      # Notify team of import operation results
+      - name: Notify import success
+        if: success() && github.event.inputs.operation != 'import-dry-run'
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: success
+          environment: ${{ github.event.inputs.environment }}
+          message: "Terraform import operation (${{ github.event.inputs.operation }}) completed successfully"
+          
+      # Alert team if import operation fails
+      - name: Notify import failure
+        if: failure()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          status: failure
+          environment: ${{ github.event.inputs.environment }}
+          message: "Terraform import operation (${{ github.event.inputs.operation }}) failed"
 
   # ===========================================================================
   # TARGET OPERATIONS JOB
