@@ -242,7 +242,7 @@ jobs:
         
       # Notify team of successful staging deployment
       - name: Notify success
-        if: success()
+        if: success() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -252,7 +252,7 @@ jobs:
           
       # Notify team if staging deployment fails
       - name: Notify failure
-        if: failure()
+        if: failure() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -321,7 +321,7 @@ jobs:
         
       # Notify team of successful production deployment
       - name: Notify success
-        if: success()
+        if: success() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -331,7 +331,7 @@ jobs:
           
       # Critical: Notify team immediately if production deployment fails
       - name: Notify failure
-        if: failure()
+        if: failure() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}

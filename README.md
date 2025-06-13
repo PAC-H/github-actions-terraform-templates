@@ -83,8 +83,10 @@ AZURE_CLIENT_ID          # Your Azure Client ID for OIDC
 
 3. (Optional) Add the following secret for Teams notifications:
 ```
-TEAMS_WEBHOOK_URL        # Your Microsoft Teams webhook URL
+TEAMS_WEBHOOK_URL        # Your Microsoft Teams webhook URL (optional)
 ```
+
+**Note:** Teams notifications are optional. If no webhook URL is configured in `base.json`, notification steps will be skipped and workflows will run normally.
 
 #### Repository Configuration
 
@@ -110,6 +112,8 @@ Fill in the configuration files in the `config/` directory:
   }
 }
 ```
+
+**Teams Notifications:** Replace `teams_webhook` with your actual Teams webhook URL, or leave as placeholder to disable notifications.
 
 **config/staging.json & config/production.json:**
 ```json
@@ -301,6 +305,12 @@ git push origin develop
    - Verify secrets are defined at repository level
    - Check if environment-specific secrets are needed
    - Ensure proper secret naming (case-sensitive)
+
+5. **Teams Notification Issues**
+   - Teams notifications are **optional** - workflows will run without them
+   - If `teams_webhook` is set to placeholder value or empty, notification steps are skipped
+   - To enable: Replace placeholder in `base.json` with actual Teams webhook URL
+   - To disable: Leave `teams_webhook` as `"REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL"` or empty string
 
 ### Debugging
 

@@ -583,7 +583,7 @@ jobs:
           
       # Notify team of import operation results
       - name: Notify import success
-        if: success() && github.event.inputs.operation != 'import-dry-run'
+        if: success() && github.event.inputs.operation != 'import-dry-run' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -593,7 +593,7 @@ jobs:
           
       # Alert team if import operation fails
       - name: Notify import failure
-        if: failure()
+        if: failure() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -680,7 +680,7 @@ jobs:
         
       # Notify team of successful targeted operation
       - name: Notify success
-        if: success()
+        if: success() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -690,7 +690,7 @@ jobs:
           
       # Alert team if targeted operation fails
       - name: Notify failure
-        if: failure()
+        if: failure() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}

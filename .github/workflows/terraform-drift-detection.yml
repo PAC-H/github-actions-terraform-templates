@@ -148,7 +148,7 @@ jobs:
           
       # Alert team via Teams when drift is detected (requires immediate attention)
       - name: Notify drift detected
-        if: steps.drift.outputs.has_drift == 'true'
+        if: steps.drift.outputs.has_drift == 'true' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -158,7 +158,7 @@ jobs:
           
       # Send confirmation when no drift is found (good news!)
       - name: Notify no drift
-        if: steps.drift.outputs.has_drift == 'false'
+        if: steps.drift.outputs.has_drift == 'false' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
