@@ -4,7 +4,7 @@
 # This workflow handles the complete deployment lifecycle for both staging and
 # production environments with automated validation, compliance checks, and
 # approval gates. It implements GitFlow branching strategy where:
-# - develop branch deploys to staging
+# - develop branch deploys to staging ONLY
 # - main branch deploys to production (after staging success)
 # =============================================================================
 
@@ -79,20 +79,16 @@ jobs:
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
 
   # ===========================================================================
-  # VALIDATION JOB
+  # STAGING VALIDATION JOB
   # ===========================================================================
-  # Runs in parallel for both environments to:
-  # 1. Validate Terraform syntax and formatting
-  # 2. Generate execution plans
-  # 3. Cache plans for later use in deployment
-  # Uses matrix strategy for parallel execution efficiency
+  # Validates staging environment for all branches and PRs
+  # Always runs to ensure staging changes are valid
   # ===========================================================================
-  validation:
+
+  validation-staging:
     runs-on: self-hosted
     needs: load-config
-    strategy:
-      matrix:
-        environment: [staging, production]  # Run validation for both environments in parallel
+    environment: staging  # Set environment context for proper secret access
     steps:
       - uses: actions/checkout@v4
       
@@ -101,10 +97,10 @@ jobs:
         uses: ./.github/actions/setup-terraform
         with:
           terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
-          working_directory: terraform/environments/${{ matrix.environment }}
-          environment: ${{ matrix.environment }}
+          working_directory: terraform/environments/staging
+          environment: staging
           
-      # Authenticate with Azure using OIDC (credentials from GitHub Secrets)
+      # Authenticate with Azure using OIDC (environment-specific secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
@@ -114,23 +110,21 @@ jobs:
           
       # Ensure Terraform code follows formatting standards
       - name: Terraform Format Check
-        working-directory: terraform/environments/${{ matrix.environment }}
+        working-directory: terraform/environments/staging
         run: terraform fmt -check -recursive
         
       # Validate Terraform syntax and configuration
       - name: Terraform Lint
-        working-directory: terraform/environments/${{ matrix.environment }}
+        working-directory: terraform/environments/staging
         run: terraform validate
         
-      # Configure remote state backend dynamically based on environment
+      # Configure remote state backend for staging
       - name: Configure backend
-        working-directory: terraform/environments/${{ matrix.environment }}
+        working-directory: terraform/environments/staging
         run: |
-          # Select appropriate config based on current environment
-          ENV_CONFIG='${{ matrix.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
-          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          BACKEND_CONFIG=$(echo '${{ needs.load-config.outputs.staging-config }}' | jq -r '.terraform.backend')
           
-          # Initialize Terraform with environment-specific backend configuration
+          # Initialize Terraform with staging backend configuration
           terraform init \
             -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
             -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
@@ -139,34 +133,104 @@ jobs:
             
       # Generate execution plan and save it for later use in deployment
       - name: Terraform Plan
-        working-directory: terraform/environments/${{ matrix.environment }}
+        working-directory: terraform/environments/staging
         run: |
-          terraform plan -out=tfplan-${{ matrix.environment }}
+          terraform plan -out=tfplan-staging
           
       # Store plan as artifact for use in deployment jobs (avoids re-planning)
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tfplan-${{ matrix.environment }}
-          path: terraform/environments/${{ matrix.environment }}/tfplan-${{ matrix.environment }}
+          name: tfplan-staging
+          path: terraform/environments/staging/tfplan-staging
           retention-days: 30
 
   # ===========================================================================
-  # COMPLIANCE SCANNING JOB
+  # PRODUCTION VALIDATION JOB
   # ===========================================================================
-  # Runs security and policy compliance checks in parallel with validation
-  # to catch issues early. Includes Azure Policy validation.
+  # Validates production environment ONLY for main branch and production manual dispatch
+  # This prevents develop branch from accessing production resources
+
+
+
   # ===========================================================================
-  compliance:
+  validation-production:
+    # Only validate production for main branch or manual production dispatch
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') || github.event_name == 'pull_request'
     runs-on: self-hosted
-    needs: [load-config, validation]
-    strategy:
-      matrix:
-        environment: [staging, production]  # Check compliance for both environments
+    needs: load-config
+    environment: production  # Set environment context for proper secret access
     steps:
       - uses: actions/checkout@v4
       
-      # Authenticate with Azure to check policy compliance (using GitHub Secrets)
+      # Setup Terraform with caching to improve performance
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
+          working_directory: terraform/environments/production
+          environment: production
+          
+      # Authenticate with Azure using OIDC (environment-specific secrets)
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          
+      # Ensure Terraform code follows formatting standards
+      - name: Terraform Format Check
+        working-directory: terraform/environments/production
+        run: terraform fmt -check -recursive
+        
+      # Validate Terraform syntax and configuration
+      - name: Terraform Lint
+        working-directory: terraform/environments/production
+        run: terraform validate
+        
+      # Configure remote state backend for production
+      - name: Configure backend
+        working-directory: terraform/environments/production
+        run: |
+          BACKEND_CONFIG=$(echo '${{ needs.load-config.outputs.production-config }}' | jq -r '.terraform.backend')
+          
+          # Initialize Terraform with production backend configuration
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      # Generate execution plan and save it for later use in deployment
+      - name: Terraform Plan
+        working-directory: terraform/environments/production
+        run: |
+          terraform plan -out=tfplan-production
+          
+      # Store plan as artifact for use in deployment jobs (avoids re-planning)
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-production
+          path: terraform/environments/production/tfplan-production
+          retention-days: 30
+
+  # ===========================================================================
+  # STAGING COMPLIANCE SCANNING JOB
+  # ===========================================================================
+  # Runs security and policy compliance checks for staging environment
+  # ===========================================================================
+  compliance-staging:
+    runs-on: self-hosted
+    needs: [load-config, validation-staging]
+    environment: staging  # Set environment context for proper secret access
+
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Authenticate with Azure to check policy compliance (environment-specific secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
@@ -177,10 +241,39 @@ jobs:
       # Check existing resources against Azure Policy definitions
       - name: Run Azure Policy Compliance Check
         run: |
-          echo "Running Azure Policy compliance check for ${{ matrix.environment }}"
-          # Query policy compliance state for environment-specific resource groups
-          # This helps identify policy violations before deployment
-          az policy state list --resource-group "rg-${{ matrix.environment }}" --all || true
+          echo "Running Azure Policy compliance check for staging"
+          # Query policy compliance state for staging resource groups
+          az policy state list --resource-group "rg-staging" --all || true
+
+  # ===========================================================================
+  # PRODUCTION COMPLIANCE SCANNING JOB
+  # ===========================================================================
+  # Runs security and policy compliance checks for production environment
+  # Only runs for main branch or production manual dispatch
+  # ===========================================================================
+  compliance-production:
+    # Only run compliance for production when appropriate
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production') || github.event_name == 'pull_request'
+    runs-on: self-hosted
+    needs: [load-config, validation-production]
+    environment: production  # Set environment context for proper secret access
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Authenticate with Azure to check policy compliance (environment-specific secrets)
+      - name: Azure Login
+        uses: ./.github/actions/azure-login
+        with:
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client_id: ${{ secrets.AZURE_CLIENT_ID }}
+          
+      # Check existing resources against Azure Policy definitions
+      - name: Run Azure Policy Compliance Check
+        run: |
+          echo "Running Azure Policy compliance check for production"
+          # Query policy compliance state for production resource groups
+          az policy state list --resource-group "rg-production" --all || true
 
   # ===========================================================================
   # STAGING DEPLOYMENT JOB
@@ -195,7 +288,7 @@ jobs:
     # Only deploy to staging from develop branch or manual trigger
     if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
     runs-on: self-hosted
-    needs: [load-config, validation, compliance]
+    needs: [load-config, validation-staging, compliance-staging]
     environment: staging  # Triggers GitHub environment protection rules and manual approval
     steps:
       - uses: actions/checkout@v4
@@ -208,7 +301,7 @@ jobs:
           working_directory: terraform/environments/staging
           environment: staging
           
-      # Authenticate with Azure for deployment operations (using GitHub Secrets)
+      # Authenticate with Azure for deployment operations (environment-specific secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
@@ -242,7 +335,7 @@ jobs:
         
       # Notify team of successful staging deployment
       - name: Notify success
-        if: success() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
+        if: success()
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -252,7 +345,7 @@ jobs:
           
       # Notify team if staging deployment fails
       - name: Notify failure
-        if: failure() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
+        if: failure()
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -274,7 +367,7 @@ jobs:
     # Production deployment conditions: main branch OR manual production trigger
     if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
     runs-on: self-hosted
-    needs: [load-config, validation, compliance, deploy-staging]  # Must wait for staging success
+    needs: [load-config, validation-production, compliance-production, deploy-staging]  # Must wait for staging success
     environment: production  # Triggers GitHub environment protection rules (manual approval)
     steps:
       - uses: actions/checkout@v4
@@ -287,7 +380,7 @@ jobs:
           working_directory: terraform/environments/production
           environment: production
           
-      # Authenticate with Azure using production credentials (from GitHub Secrets)
+      # Authenticate with Azure using production credentials (environment-specific secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
@@ -302,7 +395,7 @@ jobs:
           name: tfplan-production
           path: terraform/environments/production
           
-      # Configure production backend
+      # Reinitialize Terraform backend for production deployment
       - name: Configure backend
         working-directory: terraform/environments/production
         run: |
@@ -314,14 +407,14 @@ jobs:
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
             
-      # Apply to production (this step requires manual approval)
+      # Apply the pre-approved production plan
       - name: Terraform Apply
         working-directory: terraform/environments/production
         run: terraform apply tfplan-production
         
       # Notify team of successful production deployment
       - name: Notify success
-        if: success() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
+        if: success()
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -331,7 +424,7 @@ jobs:
           
       # Critical: Notify team immediately if production deployment fails
       - name: Notify failure
-        if: failure() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
+        if: failure()
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}

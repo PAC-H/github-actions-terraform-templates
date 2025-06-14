@@ -118,7 +118,7 @@ jobs:
           working_directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
           environment: ${{ github.event.inputs.environment || 'staging' }}
           
-      # Authenticate with Azure for test resource creation (using GitHub Secrets)
+      # Authenticate with Azure for test resource creation (environment-specific secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:

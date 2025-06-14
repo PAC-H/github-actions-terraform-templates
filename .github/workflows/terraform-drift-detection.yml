@@ -71,9 +71,9 @@ jobs:
   # ===========================================================================
   # DRIFT DETECTION JOB
   # ===========================================================================
-  # Runs terraform plan with -detailed-exitcode to detect any differences
-  # between current infrastructure state and Terraform configuration.
-  # Uses matrix strategy to check both environments in parallel.
+  # Checks for configuration drift in both staging and production environments
+  # by comparing current infrastructure state with Terraform configuration.
+  # Runs in parallel for efficiency and generates detailed drift reports.
   # ===========================================================================
   drift-detection:
     runs-on: self-hosted
@@ -81,10 +81,11 @@ jobs:
     strategy:
       matrix:
         environment: [staging, production]  # Check both environments simultaneously
+    environment: ${{ matrix.environment }}  # Set environment context for proper secret access
     steps:
       - uses: actions/checkout@v4
       
-      # Setup Terraform with caching for performance
+      # Setup Terraform with provider caching for performance
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
@@ -92,7 +93,7 @@ jobs:
           working_directory: terraform/environments/${{ matrix.environment }}
           environment: ${{ matrix.environment }}
           
-      # Authenticate with Azure to access current resource state (using GitHub Secrets)
+      # Authenticate with Azure using OIDC (environment-specific secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:

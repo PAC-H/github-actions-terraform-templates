@@ -98,6 +98,7 @@ jobs:
       matrix:
         # Dynamic environment selection based on input or default to both
         environment: ${{ github.event.inputs.environment == 'all' && fromJson('["staging", "production"]') || github.event.inputs.environment && fromJson(format('["{0}"]', github.event.inputs.environment)) || fromJson('["staging", "production"]') }}
+    environment: ${{ matrix.environment }}  # Set environment context for proper secret access
     steps:
       - uses: actions/checkout@v4
       
@@ -109,7 +110,7 @@ jobs:
           working_directory: terraform/environments/${{ matrix.environment }}
           environment: ${{ matrix.environment }}
           
-      # Authenticate with Azure for policy compliance checks (using GitHub Secrets)
+      # Authenticate with Azure for policy compliance checks (environment-specific secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:

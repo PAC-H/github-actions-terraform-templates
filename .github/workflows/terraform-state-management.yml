@@ -92,32 +92,31 @@ jobs:
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
 
   # ===========================================================================
-  # STATE OPERATION JOB
+  # STATE MANAGEMENT JOB
   # ===========================================================================
-  # Performs the selected state management operation:
-  # - UNLOCK: Removes stuck locks (use lock_id from error messages)
-  # - BACKUP: Downloads current state and uploads to backup storage
-  # - RESTORE: Downloads backup and overwrites current state
-  #
-  # SAFETY: Uses GitHub environment protection for production operations
+  # Performs critical Terraform state operations with comprehensive safety measures:
+  # - State unlock: Remove stuck locks safely
+  # - State backup: Create timestamped backups for recovery
+  # - State restore: Restore from previous backups when needed
+  # 
+  # SAFETY: All operations require environment approval for production
   # ===========================================================================
   state-operation:
     runs-on: self-hosted
     needs: load-config
-    environment: ${{ github.event.inputs.environment || 'staging' }}  # Triggers approval for production
+    environment: ${{ github.event.inputs.environment || 'staging' }}  # Set environment context for proper secret access
     steps:
       - uses: actions/checkout@v4
       
-      # Setup Terraform only for unlock operations (others use Azure CLI directly)
+      # Setup Terraform for state operations
       - name: Setup Terraform
-        if: github.event.inputs.operation == 'unlock'
         uses: ./.github/actions/setup-terraform
         with:
           terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
           working_directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
           environment: ${{ github.event.inputs.environment || 'staging' }}
           
-      # Authenticate with Azure for all state storage operations (using GitHub Secrets)
+      # Authenticate with Azure for state operations (environment-specific secrets)
       - name: Azure Login
         uses: ./.github/actions/azure-login
         with:
