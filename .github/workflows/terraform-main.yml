@@ -108,17 +108,7 @@ jobs:
           subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
-      # Ensure Terraform code follows formatting standards
-      - name: Terraform Format Check
-        working-directory: terraform/environments/staging
-        run: terraform fmt -check -recursive
-        
-      # Validate Terraform syntax and configuration
-      - name: Terraform Lint
-        working-directory: terraform/environments/staging
-        run: terraform validate
-        
-      # Configure remote state backend for staging
+      # Configure remote state backend for staging (must run before validation)
       - name: Configure backend
         working-directory: terraform/environments/staging
         run: |
@@ -130,6 +120,16 @@ jobs:
             -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      # Ensure Terraform code follows formatting standards
+      - name: Terraform Format Check
+        working-directory: terraform/environments/staging
+        run: terraform fmt -check -recursive
+        
+      # Validate Terraform syntax and configuration (requires providers to be initialized)
+      - name: Terraform Lint
+        working-directory: terraform/environments/staging
+        run: terraform validate
             
       # Generate execution plan and save it for later use in deployment
       - name: Terraform Plan
@@ -179,17 +179,7 @@ jobs:
           subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
-      # Ensure Terraform code follows formatting standards
-      - name: Terraform Format Check
-        working-directory: terraform/environments/production
-        run: terraform fmt -check -recursive
-        
-      # Validate Terraform syntax and configuration
-      - name: Terraform Lint
-        working-directory: terraform/environments/production
-        run: terraform validate
-        
-      # Configure remote state backend for production
+      # Configure remote state backend for production (must run before validation)
       - name: Configure backend
         working-directory: terraform/environments/production
         run: |
@@ -201,6 +191,16 @@ jobs:
             -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      # Ensure Terraform code follows formatting standards
+      - name: Terraform Format Check
+        working-directory: terraform/environments/production
+        run: terraform fmt -check -recursive
+        
+      # Validate Terraform syntax and configuration (requires providers to be initialized)
+      - name: Terraform Lint
+        working-directory: terraform/environments/production
+        run: terraform validate
             
       # Generate execution plan and save it for later use in deployment
       - name: Terraform Plan
