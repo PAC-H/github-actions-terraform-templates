@@ -106,7 +106,7 @@ jobs:
       
       # Setup Go runtime for Terratest execution
       - name: Setup Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5.5.0
         with:
           go-version: '1.21'  # Use Go version compatible with Terratest
           

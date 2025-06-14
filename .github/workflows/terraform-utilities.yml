@@ -133,7 +133,7 @@ jobs:
         working-directory: terraform/environments/${{ matrix.environment }}
         run: |
           # Update azurerm provider within compatible version range
-          tfupdate provider azurerm --version "> 3.0, < 4.0" .
+          tfupdate provider azurerm --version "> 4.30.0, < 5.0" .
           
       # Check if any files were modified by the update
       - name: Check for updates
@@ -149,7 +149,7 @@ jobs:
       # Automatically create PR for provider updates (only on push events)
       - name: Create Pull Request
         if: steps.check-updates.outputs.has_updates == 'true' && github.event_name == 'push'
-        uses: peter-evans/create-pull-request@v5
+        uses: peter-evans/create-pull-request@v7.0.8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "chore: update terraform providers for ${{ matrix.environment }}"
