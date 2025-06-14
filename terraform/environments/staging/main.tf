@@ -3,13 +3,15 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "~>3.0"
+      version = "~>4.30.0"
     }
   }
 }
 
 provider "azurerm" {
   features {}
+  use_oidc = true
+  resource_provider_registrations = "none"
 }
 
 # Example resource group using the module
