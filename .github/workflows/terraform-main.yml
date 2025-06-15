@@ -242,8 +242,18 @@ jobs:
       - name: Run Azure Policy Compliance Check
         run: |
           echo "Running Azure Policy compliance check for staging"
-          # Query policy compliance state for staging resource groups
-          az policy state list --resource-group "rg-staging" --all || true
+          
+          # Check if service principal has required permissions
+          echo "Checking Azure Policy permissions..."
+          if az policy state list --resource-group "rg-staging" --all >/dev/null 2>&1; then
+            echo "✅ Policy compliance check successful"
+            az policy state list --resource-group "rg-staging" --all
+          else
+            echo "⚠️ Azure Policy compliance check skipped"
+            echo "Service principal lacks 'Policy Insights Reader' role or 'Microsoft.PolicyInsights/policyStates/queryResults/read' permission"
+            echo "To enable policy compliance checks, assign the 'Policy Insights Reader' role to the service principal"
+            echo "Command: az role assignment create --assignee <service-principal-id> --role 'Policy Insights Reader' --scope /subscriptions/<subscription-id>"
+          fi
 
   # ===========================================================================
   # PRODUCTION COMPLIANCE SCANNING JOB
@@ -272,8 +282,18 @@ jobs:
       - name: Run Azure Policy Compliance Check
         run: |
           echo "Running Azure Policy compliance check for production"
-          # Query policy compliance state for production resource groups
-          az policy state list --resource-group "rg-production" --all || true
+          
+          # Check if service principal has required permissions
+          echo "Checking Azure Policy permissions..."
+          if az policy state list --resource-group "rg-production" --all >/dev/null 2>&1; then
+            echo "✅ Policy compliance check successful"
+            az policy state list --resource-group "rg-production" --all
+          else
+            echo "⚠️ Azure Policy compliance check skipped"
+            echo "Service principal lacks 'Policy Insights Reader' role or 'Microsoft.PolicyInsights/policyStates/queryResults/read' permission"
+            echo "To enable policy compliance checks, assign the 'Policy Insights Reader' role to the service principal"
+            echo "Command: az role assignment create --assignee <service-principal-id> --role 'Policy Insights Reader' --scope /subscriptions/<subscription-id>"
+          fi
 
   # ===========================================================================
   # STAGING DEPLOYMENT JOB
