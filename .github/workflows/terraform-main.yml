@@ -108,17 +108,7 @@ jobs:
           subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
-      # Ensure Terraform code follows formatting standards
-      - name: Terraform Format Check
-        working-directory: terraform/environments/staging
-        run: terraform fmt -check -recursive
-        
-      # Validate Terraform syntax and configuration
-      - name: Terraform Lint
-        working-directory: terraform/environments/staging
-        run: terraform validate
-        
-      # Configure remote state backend for staging
+      # Configure remote state backend for staging (must run before validation)
       - name: Configure backend
         working-directory: terraform/environments/staging
         run: |
@@ -130,6 +120,16 @@ jobs:
             -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      # Ensure Terraform code follows formatting standards
+      - name: Terraform Format Check
+        working-directory: terraform/environments/staging
+        run: terraform fmt -check -recursive
+        
+      # Validate Terraform syntax and configuration (requires providers to be initialized)
+      - name: Terraform Lint
+        working-directory: terraform/environments/staging
+        run: terraform validate
             
       # Generate execution plan and save it for later use in deployment
       - name: Terraform Plan
@@ -179,17 +179,7 @@ jobs:
           subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           client_id: ${{ secrets.AZURE_CLIENT_ID }}
           
-      # Ensure Terraform code follows formatting standards
-      - name: Terraform Format Check
-        working-directory: terraform/environments/production
-        run: terraform fmt -check -recursive
-        
-      # Validate Terraform syntax and configuration
-      - name: Terraform Lint
-        working-directory: terraform/environments/production
-        run: terraform validate
-        
-      # Configure remote state backend for production
+      # Configure remote state backend for production (must run before validation)
       - name: Configure backend
         working-directory: terraform/environments/production
         run: |
@@ -201,6 +191,16 @@ jobs:
             -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+      # Ensure Terraform code follows formatting standards
+      - name: Terraform Format Check
+        working-directory: terraform/environments/production
+        run: terraform fmt -check -recursive
+        
+      # Validate Terraform syntax and configuration (requires providers to be initialized)
+      - name: Terraform Lint
+        working-directory: terraform/environments/production
+        run: terraform validate
             
       # Generate execution plan and save it for later use in deployment
       - name: Terraform Plan
@@ -242,8 +242,18 @@ jobs:
       - name: Run Azure Policy Compliance Check
         run: |
           echo "Running Azure Policy compliance check for staging"
-          # Query policy compliance state for staging resource groups
-          az policy state list --resource-group "rg-staging" --all || true
+          
+          # Check if service principal has required permissions
+          echo "Checking Azure Policy permissions..."
+          if az policy state list --resource-group "rg-staging" --all >/dev/null 2>&1; then
+            echo "✅ Policy compliance check successful"
+            az policy state list --resource-group "rg-staging" --all
+          else
+            echo "⚠️ Azure Policy compliance check skipped"
+            echo "Service principal lacks 'Policy Insights Reader' role or 'Microsoft.PolicyInsights/policyStates/queryResults/read' permission"
+            echo "To enable policy compliance checks, assign the 'Policy Insights Reader' role to the service principal"
+            echo "Command: az role assignment create --assignee <service-principal-id> --role 'Policy Insights Reader' --scope /subscriptions/<subscription-id>"
+          fi
 
   # ===========================================================================
   # PRODUCTION COMPLIANCE SCANNING JOB
@@ -272,8 +282,18 @@ jobs:
       - name: Run Azure Policy Compliance Check
         run: |
           echo "Running Azure Policy compliance check for production"
-          # Query policy compliance state for production resource groups
-          az policy state list --resource-group "rg-production" --all || true
+          
+          # Check if service principal has required permissions
+          echo "Checking Azure Policy permissions..."
+          if az policy state list --resource-group "rg-production" --all >/dev/null 2>&1; then
+            echo "✅ Policy compliance check successful"
+            az policy state list --resource-group "rg-production" --all
+          else
+            echo "⚠️ Azure Policy compliance check skipped"
+            echo "Service principal lacks 'Policy Insights Reader' role or 'Microsoft.PolicyInsights/policyStates/queryResults/read' permission"
+            echo "To enable policy compliance checks, assign the 'Policy Insights Reader' role to the service principal"
+            echo "Command: az role assignment create --assignee <service-principal-id> --role 'Policy Insights Reader' --scope /subscriptions/<subscription-id>"
+          fi
 
   # ===========================================================================
   # STAGING DEPLOYMENT JOB
@@ -335,7 +355,7 @@ jobs:
         
       # Notify team of successful staging deployment
       - name: Notify success
-        if: success()
+        if: success() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -345,7 +365,7 @@ jobs:
           
       # Notify team if staging deployment fails
       - name: Notify failure
-        if: failure()
+        if: failure() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -414,7 +434,7 @@ jobs:
         
       # Notify team of successful production deployment
       - name: Notify success
-        if: success()
+        if: success() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
@@ -424,7 +444,7 @@ jobs:
           
       # Critical: Notify team immediately if production deployment fails
       - name: Notify failure
-        if: failure()
+        if: failure() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
         uses: ./.github/actions/teams-notification
         with:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}

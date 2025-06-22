@@ -208,6 +208,12 @@ jobs:
             -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
             -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
             
+      # Install Graphviz for dependency graph generation
+      - name: Install Graphviz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz
+          
       # Generate dependency graph in multiple formats
       - name: Generate dependency graph
         working-directory: terraform/environments/${{ github.event.inputs.environment }}
