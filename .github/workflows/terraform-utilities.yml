@@ -15,6 +15,10 @@
 # - Comprehensive import functionality with safety measures
 # - Parallel execution for efficiency
 # - Smart triggering based on file changes
+#
+# PATH RESOLUTION NOTE:
+# When working-directory is set to terraform/environments/{env}, config files
+# must be accessed using relative paths: ../../../config/imports/file.json
 # =============================================================================
 
 name: 'Terraform Utilities'
@@ -321,6 +325,7 @@ jobs:
           fi
           
       # Validate bulk import configuration file
+      # Note: This step runs from repository root, so no path adjustment needed
       - name: Validate bulk import config
         if: github.event.inputs.operation == 'import-bulk'
         run: |
@@ -400,10 +405,11 @@ jobs:
             
           elif [ "${{ github.event.inputs.operation }}" = "import-bulk" ]; then
             # Bulk import validation
-            CONFIG_FILE="${{ github.event.inputs.import_config_file }}"
+            # Path resolution: Adjust for working-directory being terraform/environments/{env}
+            CONFIG_FILE="../../../${{ github.event.inputs.import_config_file }}"
             
-            echo "### Bulk Import" >> $REPORT_FILE
-            echo "- **Configuration File**: \`$CONFIG_FILE\`" >> $REPORT_FILE
+            echo "### Bulk Import" >> $REPORT_FILE  
+            echo "- **Configuration File**: \`${{ github.event.inputs.import_config_file }}\`" >> $REPORT_FILE
             echo "" >> $REPORT_FILE
             
             # Parse and validate each import
@@ -455,7 +461,8 @@ jobs:
         if: github.event.inputs.operation == 'import-bulk'
         working-directory: terraform/environments/${{ github.event.inputs.environment }}
         run: |
-          CONFIG_FILE="${{ github.event.inputs.import_config_file }}"
+          # Path resolution: Adjust for working-directory being terraform/environments/{env}
+          CONFIG_FILE="../../../${{ github.event.inputs.import_config_file }}"
           
           echo "🚀 Starting bulk import from: $CONFIG_FILE"
           
