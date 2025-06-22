@@ -6,12 +6,16 @@
 # 1. UNLOCK OPERATION: Force-unlock stuck Terraform state files
 # 2. BACKUP OPERATION: Create timestamped backups of state files
 # 3. RESTORE OPERATION: Restore state files from previous backups
+# 4. LIST OPERATION: List all resources in Terraform state
+# 5. SHOW OPERATION: Show detailed information about specific resource
+# 6. REMOVE OPERATION: Remove resource from state without destroying it
 #
 # CRITICAL SAFETY NOTES:
 # - These operations directly manipulate Terraform state files
 # - Improper use can cause data loss or infrastructure corruption
 # - Always ensure you have recent backups before performing operations
 # - Test restore operations in non-production environments first
+# - REMOVE operation creates automatic backup before execution
 # =============================================================================
 
 name: 'Terraform State Management'
@@ -30,6 +34,9 @@ on:
           - unlock    # Force unlock stuck state file
           - backup    # Create manual backup of state files
           - restore   # Restore state from backup
+          - list      # List all resources in state
+          - show      # Show detailed information about specific resource
+          - remove    # Remove resource from state without destroying
       environment:
         description: 'Environment'
         required: true
@@ -42,6 +49,9 @@ on:
         required: false
       backup_name:
         description: 'Backup name (required for restore operation)'
+        required: false
+      resource_address:
+        description: 'Resource address (required for show and remove operations, e.g., azurerm_resource_group.main)'
         required: false
   schedule:
     - cron: '0 2 * * 0'  # Weekly backup on Sundays at 2 AM UTC (off-peak hours)
@@ -142,6 +152,120 @@ jobs:
           # Force unlock using the provided lock ID
           terraform force-unlock ${{ github.event.inputs.lock_id }}
           
+      # INPUT VALIDATION: Validate required inputs for show and remove operations
+      - name: Validate resource address
+        if: github.event.inputs.operation == 'show' || github.event.inputs.operation == 'remove'
+        run: |
+          if [ -z "${{ github.event.inputs.resource_address }}" ]; then
+            echo "❌ Error: resource_address is required for ${{ github.event.inputs.operation }} operation"
+            echo "Example: azurerm_resource_group.main"
+            exit 1
+          fi
+          
+      # LIST OPERATION: List all resources in Terraform state
+      - name: List state resources
+        if: github.event.inputs.operation == 'list'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          # Initialize Terraform to access state
+          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+          echo "📋 Listing all resources in ${{ github.event.inputs.environment }} state:"
+          terraform state list > state-list-${{ github.event.inputs.environment }}.txt
+          
+          # Display list and count
+          RESOURCE_COUNT=$(wc -l < state-list-${{ github.event.inputs.environment }}.txt)
+          echo "Found $RESOURCE_COUNT resources in state:"
+          cat state-list-${{ github.event.inputs.environment }}.txt
+          
+      # SHOW OPERATION: Show detailed information about specific resource
+      - name: Show resource details
+        if: github.event.inputs.operation == 'show'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          # Initialize Terraform to access state
+          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+          # Check if resource exists in state first
+          if ! terraform state list | grep -q "^${{ github.event.inputs.resource_address }}$"; then
+            echo "❌ Error: Resource '${{ github.event.inputs.resource_address }}' not found in state"
+            echo "Available resources:"
+            terraform state list
+            exit 1
+          fi
+          
+          echo "🔍 Showing details for resource: ${{ github.event.inputs.resource_address }}"
+          terraform state show "${{ github.event.inputs.resource_address }}" > resource-details-${{ github.event.inputs.environment }}.txt
+          cat resource-details-${{ github.event.inputs.environment }}.txt
+          
+      # REMOVE OPERATION: Remove resource from state without destroying (with safety backup)
+      - name: Remove resource from state
+        if: github.event.inputs.operation == 'remove'
+        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        run: |
+          # Initialize Terraform to access state
+          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
+          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
+          
+          terraform init \
+            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
+            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
+            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
+            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
+            
+          # Check if resource exists in state first
+          if ! terraform state list | grep -q "^${{ github.event.inputs.resource_address }}$"; then
+            echo "❌ Error: Resource '${{ github.event.inputs.resource_address }}' not found in state"
+            echo "Available resources:"
+            terraform state list
+            exit 1
+          fi
+          
+          # Create safety backup before removal
+          echo "🔐 Creating safety backup before removal..."
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          terraform state pull > pre-removal-backup-${TIMESTAMP}.tfstate
+          
+          # Show resource details before removal for audit trail
+          echo "📋 Resource details before removal:"
+          terraform state show "${{ github.event.inputs.resource_address }}" > removed-resource-details-${TIMESTAMP}.txt
+          cat removed-resource-details-${TIMESTAMP}.txt
+          
+          # Perform the removal
+          echo "🗑️ Removing resource from state: ${{ github.event.inputs.resource_address }}"
+          terraform state rm "${{ github.event.inputs.resource_address }}"
+          
+          # Verify removal
+          echo "✅ Resource removed. Current state contains:"
+          terraform state list
+          
+      # Upload state operation artifacts
+      - name: Upload operation artifacts
+        if: github.event.inputs.operation == 'list' || github.event.inputs.operation == 'show' || github.event.inputs.operation == 'remove'
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-operation-${{ github.event.inputs.operation }}-${{ github.event.inputs.environment }}
+          path: |
+            terraform/environments/${{ github.event.inputs.environment }}/state-list-*.txt
+            terraform/environments/${{ github.event.inputs.environment }}/resource-details-*.txt
+            terraform/environments/${{ github.event.inputs.environment }}/pre-removal-backup-*.tfstate
+            terraform/environments/${{ github.event.inputs.environment }}/removed-resource-details-*.txt
+          retention-days: 30
+          
       # BACKUP OPERATION: Create timestamped backups of all state files
       - name: Backup state files
         if: github.event.inputs.operation == 'backup' || github.event_name == 'schedule'
@@ -218,7 +342,7 @@ jobs:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
           status: success
           environment: ${{ github.event.inputs.environment || 'all' }}
-          message: "State ${{ github.event.inputs.operation || 'backup' }} operation completed successfully"
+          message: "State ${{ github.event.inputs.operation || 'backup' }} operation completed successfully${{ github.event.inputs.operation == 'remove' && format(' - Resource {0} removed from state', github.event.inputs.resource_address) || '' }}"
           
       # Critical: Alert team immediately if state operation fails
       - name: Notify failure
@@ -228,4 +352,4 @@ jobs:
           webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
           status: failure
           environment: ${{ github.event.inputs.environment || 'all' }}
-          message: "State ${{ github.event.inputs.operation || 'backup' }} operation failed" 
+          message: "State ${{ github.event.inputs.operation || 'backup' }} operation failed${{ github.event.inputs.operation == 'remove' && format(' - Resource {0} removal failed', github.event.inputs.resource_address) || '' }}" 
