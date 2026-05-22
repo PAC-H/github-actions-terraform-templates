@@ -3,7 +3,10 @@
     "version": "1.7.0",
     "providers": {
       "azurerm": {
-        "version": "~> 3.0"
+        "version": "~> 4.30.0"
+      },
+      "databricks": {
+        "version": "~> 1.50"
       }
     },
     "cache": {
@@ -23,7 +26,7 @@
     "labels": ["self-hosted", "linux", "x64"]
   },
   "_comments": {
-    "azure_credentials": "Azure authentication credentials (tenant_id, subscription_id, client_id) are now managed via GitHub Secrets for enhanced security. Add these to your repository secrets: AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, AZURE_CLIENT_ID",
+    "azure_credentials": "Azure authentication uses OIDC federated credentials (no client secrets). Required GitHub secrets: AZURE_TENANT_ID, AZURE_CLIENT_ID_DEV_QA, AZURE_SUBSCRIPTION_DEV_QA, AZURE_CLIENT_ID_STAGING_PROD, AZURE_SUBSCRIPTION_STAGING_PROD. See config/subscriptions.json for the full mapping.",
     "teams_webhook": "Replace with your actual Teams channel webhook URL for notifications",
     "backup_storage": "Replace with your actual Azure storage account name for state backups",
     "terraform_cache": "Provider caching improves performance by avoiding repeated downloads"

@@ -1,0 +1,16 @@
+{
+  "env_to_subscription": {
+    "dev": "dev-qa",
+    "qa": "dev-qa",
+    "staging": "staging-prod",
+    "prod": "staging-prod"
+  },
+  "subscriptions": {
+    "dev-qa": {
+      "state_container": "terraform-state"
+    },
+    "staging-prod": {
+      "state_container": "terraform-state"
+    }
+  }
+}

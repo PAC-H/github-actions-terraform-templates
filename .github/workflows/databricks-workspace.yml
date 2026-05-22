@@ -1,0 +1,522 @@
+name: Databricks Workspace
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - "teams/**"
+      - "terraform/modules/databricks-workspace/**"
+      - "terraform/databricks/**"
+  pull_request:
+    paths:
+      - "teams/**"
+      - "terraform/modules/databricks-workspace/**"
+      - "terraform/databricks/**"
+  workflow_dispatch:
+    inputs:
+      team:
+        description: "Team name (folder name under teams/) or 'all' to run all teams"
+        required: true
+        default: "all"
+      environment:
+        description: "Environment (dev|qa|staging|prod|all)"
+        required: true
+        default: "all"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Load shared config (runners, etc.) — runs first so other jobs can use outputs
+  # ─────────────────────────────────────────────────────────────────────────────
+  _config:
+    name: Load Config
+    runs-on: [self-hosted, linux, x64]
+    outputs:
+      runners: ${{ steps.load.outputs.runners }}
+      teams_webhook: ${{ steps.load.outputs.teams_webhook }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load base config
+        id: load
+        run: |
+          RUNNERS=$(jq -c '.runners.labels' config/base.json)
+          WEBHOOK=$(jq -r '.notifications.teams_webhook' config/base.json)
+          echo "runners=$RUNNERS" >> "$GITHUB_OUTPUT"
+          echo "teams_webhook=$WEBHOOK" >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Detect which teams and environments need to be processed
+  # ─────────────────────────────────────────────────────────────────────────────
+  detect-changes:
+    name: Detect Changed Teams
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    needs: _config
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      has-changes: ${{ steps.build-matrix.outputs.has-changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Build team/env matrix
+        id: build-matrix
+        env:
+          TEAM_INPUT: ${{ github.event.inputs.team || '' }}
+          ENV_INPUT: ${{ github.event.inputs.environment || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          pairs=()
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$TEAM_INPUT" == "all" ]]; then
+              teams=$(ls teams/ | grep -v '^_')
+            else
+              teams="$TEAM_INPUT"
+            fi
+
+            for team in $teams; do
+              team_yaml="teams/${team}/team.yaml"
+              if [[ ! -f "$team_yaml" ]]; then
+                echo "::warning::No team.yaml found for team '$team', skipping"
+                continue
+              fi
+
+              all_envs=$(python3 -c "
+          import yaml, sys
+          with open('$team_yaml') as f:
+              cfg = yaml.safe_load(f)
+          print('\n'.join(cfg.get('environments', [])))
+          ")
+
+              if [[ "$ENV_INPUT" == "all" ]]; then
+                envs="$all_envs"
+              else
+                envs="$ENV_INPUT"
+              fi
+
+              for env in $envs; do
+                if echo "$all_envs" | grep -qx "$env"; then
+                  sub_alias=$(python3 -c "
+          import json
+          with open('config/subscriptions.json') as f:
+              cfg = json.load(f)
+          print(cfg['env_to_subscription'].get('$env', ''))
+          ")
+                  pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${sub_alias}\"}")
+                else
+                  echo "::warning::Team '$team' does not have environment '$env', skipping"
+                fi
+              done
+            done
+
+          else
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              base_sha="${{ github.event.pull_request.base.sha }}"
+            else
+              base_sha="HEAD~1"
+            fi
+
+            changed_files=$(git diff --name-only "$base_sha" HEAD)
+            echo "Changed files:"
+            echo "$changed_files"
+
+            module_changed=$(echo "$changed_files" | grep -E "^terraform/(modules/databricks-workspace|databricks)/" | head -1 || true)
+
+            if [[ -n "$module_changed" ]]; then
+              echo "Module files changed — queuing all teams"
+              changed_teams=$(ls teams/ | grep -v '^_')
+            else
+              changed_teams=$(echo "$changed_files" | grep "^teams/" | sed 's|teams/||;s|/.*||' | grep -v '^_' | sort -u || true)
+            fi
+
+            for team in $changed_teams; do
+              team_yaml="teams/${team}/team.yaml"
+              if [[ ! -f "$team_yaml" ]]; then
+                continue
+              fi
+
+              envs=$(python3 -c "
+          import yaml
+          with open('$team_yaml') as f:
+              cfg = yaml.safe_load(f)
+          print('\n'.join(cfg.get('environments', [])))
+          ")
+
+              for env in $envs; do
+                sub_alias=$(python3 -c "
+          import json
+          with open('config/subscriptions.json') as f:
+              cfg = json.load(f)
+          print(cfg['env_to_subscription'].get('$env', ''))
+          ")
+                pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${sub_alias}\"}")
+              done
+            done
+          fi
+
+          if [[ ${#pairs[@]} -eq 0 ]]; then
+            echo "No teams to process"
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "has-changes=false" >> "$GITHUB_OUTPUT"
+          else
+            joined=$(IFS=,; echo "${pairs[*]}")
+            echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
+            echo "has-changes=true" >> "$GITHUB_OUTPUT"
+            echo "Matrix: {\"include\":[${joined}]}"
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Plan — runs for every team+env in the matrix
+  # ─────────────────────────────────────────────────────────────────────────────
+  plan:
+    name: "Plan · ${{ matrix.team }} / ${{ matrix.environment }}"
+    needs: [_config, detect-changes]
+    if: needs.detect-changes.outputs.has-changes == 'true'
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    # All subscription secrets exposed as env vars so the resolve step can select
+    # the right one via shell logic (GitHub Actions does not support dynamic secret
+    # access via secrets[variable] notation).
+    env:
+      AZURE_SUB_DEV_QA: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
+      AZURE_CLIENT_DEV_QA: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
+      AZURE_SUB_STAGING_PROD: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
+      AZURE_CLIENT_STAGING_PROD: ${{ secrets.AZURE_CLIENT_ID_STAGING_PROD }}
+      TF_SA_DEV_QA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_DEV_QA }}
+      TF_SA_STAGING_PROD: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
+      TF_RG_DEV_QA: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
+      TF_RG_STAGING_PROD: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse team config
+        id: team-config
+        run: |
+          TEAM="${{ matrix.team }}"
+          ENV="${{ matrix.environment }}"
+          TEAM_YAML="teams/${TEAM}/team.yaml"
+
+          python3 - <<EOF
+          import yaml, json, os
+
+          with open("$TEAM_YAML") as f:
+              cfg = yaml.safe_load(f)
+
+          env_cfg = cfg["azure"]["per_env"]["$ENV"]
+          db_cfg  = cfg.get("databricks", {})
+          tags    = db_cfg.get("tags", {})
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a") as f:
+              f.write(f"resource_group_name={env_cfg['resource_group_name']}\n")
+              f.write(f"public_subnet_id={env_cfg['public_subnet_id']}\n")
+              f.write(f"private_subnet_id={env_cfg['private_subnet_id']}\n")
+              f.write(f"compliance_profile={env_cfg.get('compliance_profile', 'standard')}\n")
+              f.write(f"sku={db_cfg.get('sku', 'premium')}\n")
+              f.write(f"tags_json={json.dumps(tags)}\n")
+          EOF
+
+      - name: Resolve subscription credentials
+        id: sub
+        run: |
+          ALIAS="${{ matrix.subscription_alias }}"
+          if [[ "$ALIAS" == "dev-qa" ]]; then
+            echo "sub_id=$AZURE_SUB_DEV_QA"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_DEV_QA" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_DEV_QA"             >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_DEV_QA"             >> "$GITHUB_OUTPUT"
+          else
+            echo "sub_id=$AZURE_SUB_STAGING_PROD"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_STAGING_PROD" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+          fi
+          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/subscriptions.json)
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ steps.sub.outputs.sub_id }}
+          client-id: ${{ steps.sub.outputs.client_id }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          working_directory: terraform/databricks
+          environment: ${{ matrix.environment }}
+
+      - name: Terraform init
+        working-directory: terraform/databricks
+        env:
+          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
+          RESOURCE_GROUP: ${{ steps.sub.outputs.rg }}
+          CONTAINER: ${{ steps.sub.outputs.container }}
+          STATE_KEY: "teams/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=$STORAGE_ACCOUNT" \
+            -backend-config="container_name=$CONTAINER" \
+            -backend-config="resource_group_name=$RESOURCE_GROUP" \
+            -backend-config="key=$STATE_KEY"
+
+      - name: Terraform plan
+        id: plan
+        working-directory: terraform/databricks
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
+          TF_VAR_team_name: ${{ matrix.team }}
+          TF_VAR_environment: ${{ matrix.environment }}
+          TF_VAR_resource_group_name: ${{ steps.team-config.outputs.resource_group_name }}
+          TF_VAR_public_subnet_id: ${{ steps.team-config.outputs.public_subnet_id }}
+          TF_VAR_private_subnet_id: ${{ steps.team-config.outputs.private_subnet_id }}
+          TF_VAR_compliance_profile: ${{ steps.team-config.outputs.compliance_profile }}
+          TF_VAR_sku: ${{ steps.team-config.outputs.sku }}
+        run: |
+          # -detailed-exitcode exits 0=no changes, 1=error, 2=changes present.
+          # Disable pipefail around this command so exit code 2 is handled explicitly.
+          set +e
+          terraform plan \
+            -out=tfplan \
+            -detailed-exitcode \
+            -input=false 2>&1 | tee plan.log
+          TF_EXIT=${PIPESTATUS[0]}
+          set -e
+          if [[ $TF_EXIT -eq 1 ]]; then
+            echo "Terraform plan failed"
+            exit 1
+          fi
+          echo "exitcode=$TF_EXIT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.team }}-${{ matrix.environment }}
+          path: |
+            terraform/databricks/tfplan
+            terraform/databricks/plan.log
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Apply — dev and qa: auto-apply after successful plan
+  # ─────────────────────────────────────────────────────────────────────────────
+  apply-lower:
+    name: "Apply · ${{ matrix.team }} / ${{ matrix.environment }}"
+    needs: [_config, detect-changes, plan]
+    if: |
+      needs.detect-changes.outputs.has-changes == 'true' &&
+      (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') &&
+      github.event_name != 'pull_request' &&
+      contains(fromJson('["dev","qa"]'), matrix.environment)
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    env:
+      AZURE_SUB_DEV_QA: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
+      AZURE_CLIENT_DEV_QA: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
+      AZURE_SUB_STAGING_PROD: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
+      AZURE_CLIENT_STAGING_PROD: ${{ secrets.AZURE_CLIENT_ID_STAGING_PROD }}
+      TF_SA_DEV_QA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_DEV_QA }}
+      TF_SA_STAGING_PROD: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
+      TF_RG_DEV_QA: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
+      TF_RG_STAGING_PROD: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve subscription credentials
+        id: sub
+        run: |
+          ALIAS="${{ matrix.subscription_alias }}"
+          if [[ "$ALIAS" == "dev-qa" ]]; then
+            echo "sub_id=$AZURE_SUB_DEV_QA"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_DEV_QA" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_DEV_QA"             >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_DEV_QA"             >> "$GITHUB_OUTPUT"
+          else
+            echo "sub_id=$AZURE_SUB_STAGING_PROD"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_STAGING_PROD" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+          fi
+          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/subscriptions.json)
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ steps.sub.outputs.sub_id }}
+          client-id: ${{ steps.sub.outputs.client_id }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          working_directory: terraform/databricks
+          environment: ${{ matrix.environment }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.team }}-${{ matrix.environment }}
+          path: terraform/databricks/
+
+      - name: Terraform init
+        working-directory: terraform/databricks
+        env:
+          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
+          RESOURCE_GROUP: ${{ steps.sub.outputs.rg }}
+          CONTAINER: ${{ steps.sub.outputs.container }}
+          STATE_KEY: "teams/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=$STORAGE_ACCOUNT" \
+            -backend-config="container_name=$CONTAINER" \
+            -backend-config="resource_group_name=$RESOURCE_GROUP" \
+            -backend-config="key=$STATE_KEY"
+
+      - name: Terraform apply
+        working-directory: terraform/databricks
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+        run: terraform apply -input=false tfplan
+
+      - name: Notify Teams
+        if: always()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          status: ${{ job.status }}
+          environment: "${{ matrix.team }} / ${{ matrix.environment }}"
+          message: "Databricks workspace apply ${{ job.status }}"
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Apply — staging and prod: requires manual approval via GitHub environment
+  # ─────────────────────────────────────────────────────────────────────────────
+  apply-upper:
+    name: "Apply · ${{ matrix.team }} / ${{ matrix.environment }}"
+    needs: [_config, detect-changes, plan]
+    if: |
+      needs.detect-changes.outputs.has-changes == 'true' &&
+      github.ref == 'refs/heads/main' &&
+      github.event_name != 'pull_request' &&
+      contains(fromJson('["staging","prod"]'), matrix.environment)
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    environment: databricks-${{ matrix.environment }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+    env:
+      AZURE_SUB_DEV_QA: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
+      AZURE_CLIENT_DEV_QA: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
+      AZURE_SUB_STAGING_PROD: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
+      AZURE_CLIENT_STAGING_PROD: ${{ secrets.AZURE_CLIENT_ID_STAGING_PROD }}
+      TF_SA_DEV_QA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_DEV_QA }}
+      TF_SA_STAGING_PROD: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
+      TF_RG_DEV_QA: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
+      TF_RG_STAGING_PROD: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve subscription credentials
+        id: sub
+        run: |
+          ALIAS="${{ matrix.subscription_alias }}"
+          if [[ "$ALIAS" == "dev-qa" ]]; then
+            echo "sub_id=$AZURE_SUB_DEV_QA"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_DEV_QA" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_DEV_QA"             >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_DEV_QA"             >> "$GITHUB_OUTPUT"
+          else
+            echo "sub_id=$AZURE_SUB_STAGING_PROD"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_STAGING_PROD" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+          fi
+          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/subscriptions.json)
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ steps.sub.outputs.sub_id }}
+          client-id: ${{ steps.sub.outputs.client_id }}
+
+      - name: Setup Terraform
+        uses: ./.github/actions/setup-terraform
+        with:
+          working_directory: terraform/databricks
+          environment: ${{ matrix.environment }}
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.team }}-${{ matrix.environment }}
+          path: terraform/databricks/
+
+      - name: Terraform init
+        working-directory: terraform/databricks
+        env:
+          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
+          RESOURCE_GROUP: ${{ steps.sub.outputs.rg }}
+          CONTAINER: ${{ steps.sub.outputs.container }}
+          STATE_KEY: "teams/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=$STORAGE_ACCOUNT" \
+            -backend-config="container_name=$CONTAINER" \
+            -backend-config="resource_group_name=$RESOURCE_GROUP" \
+            -backend-config="key=$STATE_KEY"
+
+      - name: Terraform apply
+        working-directory: terraform/databricks
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+        run: terraform apply -input=false tfplan
+
+      - name: Notify Teams
+        if: always()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          status: ${{ job.status }}
+          environment: "${{ matrix.team }} / ${{ matrix.environment }}"
+          message: "Databricks workspace apply ${{ job.status }}"
