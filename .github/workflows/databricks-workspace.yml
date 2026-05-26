@@ -59,7 +59,11 @@ jobs:
     needs: _config
     outputs:
       matrix: ${{ steps.build-matrix.outputs.matrix }}
+      matrix-lower: ${{ steps.build-matrix.outputs.matrix-lower }}
+      matrix-upper: ${{ steps.build-matrix.outputs.matrix-upper }}
       has-changes: ${{ steps.build-matrix.outputs.has-changes }}
+      has-lower: ${{ steps.build-matrix.outputs.has-lower }}
+      has-upper: ${{ steps.build-matrix.outputs.has-upper }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -160,15 +164,47 @@ jobs:
             done
           fi
 
+          lower_pairs=()
+          upper_pairs=()
+          for pair in "${pairs[@]}"; do
+            if [[ "$pair" == *'"environment":"dev"'* || "$pair" == *'"environment":"qa"'* ]]; then
+              lower_pairs+=("$pair")
+            elif [[ "$pair" == *'"environment":"staging"'* || "$pair" == *'"environment":"prod"'* ]]; then
+              upper_pairs+=("$pair")
+            fi
+          done
+
           if [[ ${#pairs[@]} -eq 0 ]]; then
             echo "No teams to process"
             echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "matrix-lower={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "matrix-upper={\"include\":[]}" >> "$GITHUB_OUTPUT"
             echo "has-changes=false" >> "$GITHUB_OUTPUT"
+            echo "has-lower=false" >> "$GITHUB_OUTPUT"
+            echo "has-upper=false" >> "$GITHUB_OUTPUT"
           else
             joined=$(IFS=,; echo "${pairs[*]}")
             echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
             echo "has-changes=true" >> "$GITHUB_OUTPUT"
             echo "Matrix: {\"include\":[${joined}]}"
+
+            if [[ ${#lower_pairs[@]} -gt 0 ]]; then
+              joined_lower=$(IFS=,; echo "${lower_pairs[*]}")
+              echo "matrix-lower={\"include\":[${joined_lower}]}" >> "$GITHUB_OUTPUT"
+              echo "has-lower=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "matrix-lower={\"include\":[]}" >> "$GITHUB_OUTPUT"
+              echo "has-lower=false" >> "$GITHUB_OUTPUT"
+            fi
+
+            if [[ ${#upper_pairs[@]} -gt 0 ]]; then
+              joined_upper=$(IFS=,; echo "${upper_pairs[*]}")
+              echo "matrix-upper={\"include\":[${joined_upper}]}" >> "$GITHUB_OUTPUT"
+              echo "has-upper=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "matrix-upper={\"include\":[]}" >> "$GITHUB_OUTPUT"
+              echo "has-upper=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -314,14 +350,13 @@ jobs:
     name: "Apply · ${{ matrix.team }} / ${{ matrix.environment }}"
     needs: [_config, detect-changes, plan]
     if: |
-      needs.detect-changes.outputs.has-changes == 'true' &&
+      needs.detect-changes.outputs.has-lower == 'true' &&
       (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/main') &&
-      github.event_name != 'pull_request' &&
-      contains(fromJson('["dev","qa"]'), matrix.environment)
+      github.event_name != 'pull_request'
     runs-on: ${{ fromJson(needs._config.outputs.runners) }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix-lower) }}
     env:
       AZURE_SUB_DEV_QA: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
       AZURE_CLIENT_DEV_QA: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
@@ -415,15 +450,14 @@ jobs:
     name: "Apply · ${{ matrix.team }} / ${{ matrix.environment }}"
     needs: [_config, detect-changes, plan]
     if: |
-      needs.detect-changes.outputs.has-changes == 'true' &&
+      needs.detect-changes.outputs.has-upper == 'true' &&
       github.ref == 'refs/heads/main' &&
-      github.event_name != 'pull_request' &&
-      contains(fromJson('["staging","prod"]'), matrix.environment)
+      github.event_name != 'pull_request'
     runs-on: ${{ fromJson(needs._config.outputs.runners) }}
     environment: databricks-${{ matrix.environment }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix-upper) }}
     env:
       AZURE_SUB_DEV_QA: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
       AZURE_CLIENT_DEV_QA: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
