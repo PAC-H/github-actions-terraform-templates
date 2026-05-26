@@ -84,18 +84,17 @@ jobs:
             fi
 
             for team in $teams; do
-              team_yaml="teams/${team}/team.yaml"
-              if [[ ! -f "$team_yaml" ]]; then
-                echo "::warning::No team.yaml found for team '$team', skipping"
+              env_dir="teams/${team}/envs"
+              if [[ ! -d "$env_dir" ]]; then
+                echo "::warning::No envs/ directory found for team '$team', skipping"
                 continue
               fi
 
-              all_envs=$(python3 -c "
-          import yaml, sys
-          with open('$team_yaml') as f:
-              cfg = yaml.safe_load(f)
-          print('\n'.join(cfg.get('environments', [])))
-          ")
+              all_envs=$(ls "$env_dir" 2>/dev/null | grep '\.tfvars$' | sed 's/\.tfvars$//' | sort)
+              if [[ -z "$all_envs" ]]; then
+                echo "::warning::No envs/*.tfvars files found for team '$team', skipping"
+                continue
+              fi
 
               if [[ "$ENV_INPUT" == "all" ]]; then
                 envs="$all_envs"
@@ -139,17 +138,15 @@ jobs:
             fi
 
             for team in $changed_teams; do
-              team_yaml="teams/${team}/team.yaml"
-              if [[ ! -f "$team_yaml" ]]; then
+              env_dir="teams/${team}/envs"
+              if [[ ! -d "$env_dir" ]]; then
                 continue
               fi
 
-              envs=$(python3 -c "
-          import yaml
-          with open('$team_yaml') as f:
-              cfg = yaml.safe_load(f)
-          print('\n'.join(cfg.get('environments', [])))
-          ")
+              envs=$(ls "$env_dir" 2>/dev/null | grep '\.tfvars$' | sed 's/\.tfvars$//' | sort)
+              if [[ -z "$envs" ]]; then
+                continue
+              fi
 
               for env in $envs; do
                 sub_alias=$(python3 -c "
@@ -201,32 +198,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Parse team config
-        id: team-config
+      - name: Validate team config files
+        env:
+          TEAM: ${{ matrix.team }}
+          ENVIRONMENT: ${{ matrix.environment }}
         run: |
-          TEAM="${{ matrix.team }}"
-          ENV="${{ matrix.environment }}"
-          TEAM_YAML="teams/${TEAM}/team.yaml"
+          set -euo pipefail
+          TEAM_DIR="teams/${TEAM}"
+          COMMON="${TEAM_DIR}/common.tfvars"
+          ENV_FILE="${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars"
 
-          python3 - <<EOF
-          import yaml, json, os
+          missing=()
+          [[ -f "$COMMON"   ]] || missing+=("$COMMON")
+          [[ -f "$ENV_FILE" ]] || missing+=("$ENV_FILE")
 
-          with open("$TEAM_YAML") as f:
-              cfg = yaml.safe_load(f)
-
-          env_cfg = cfg["azure"]["per_env"]["$ENV"]
-          db_cfg  = cfg.get("databricks", {})
-          tags    = db_cfg.get("tags", {})
-
-          out = os.environ["GITHUB_OUTPUT"]
-          with open(out, "a") as f:
-              f.write(f"resource_group_name={env_cfg['resource_group_name']}\n")
-              f.write(f"public_subnet_id={env_cfg['public_subnet_id']}\n")
-              f.write(f"private_subnet_id={env_cfg['private_subnet_id']}\n")
-              f.write(f"compliance_profile={env_cfg.get('compliance_profile', 'standard')}\n")
-              f.write(f"sku={db_cfg.get('sku', 'premium')}\n")
-              f.write(f"tags_json={json.dumps(tags)}\n")
-          EOF
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing required config files for ${TEAM}/${ENVIRONMENT}:"
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
 
       - name: Resolve subscription credentials
         id: sub
@@ -277,6 +267,10 @@ jobs:
             -backend-config="resource_group_name=$RESOURCE_GROUP" \
             -backend-config="key=$STATE_KEY"
 
+      - name: Terraform validate
+        working-directory: terraform/databricks
+        run: terraform validate
+
       - name: Terraform plan
         id: plan
         working-directory: terraform/databricks
@@ -286,18 +280,13 @@ jobs:
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
           TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
-          TF_VAR_team_name: ${{ matrix.team }}
-          TF_VAR_environment: ${{ matrix.environment }}
-          TF_VAR_resource_group_name: ${{ steps.team-config.outputs.resource_group_name }}
-          TF_VAR_public_subnet_id: ${{ steps.team-config.outputs.public_subnet_id }}
-          TF_VAR_private_subnet_id: ${{ steps.team-config.outputs.private_subnet_id }}
-          TF_VAR_compliance_profile: ${{ steps.team-config.outputs.compliance_profile }}
-          TF_VAR_sku: ${{ steps.team-config.outputs.sku }}
         run: |
           # -detailed-exitcode exits 0=no changes, 1=error, 2=changes present.
           # Disable pipefail around this command so exit code 2 is handled explicitly.
           set +e
           terraform plan \
+            -var-file=../../teams/${{ matrix.team }}/common.tfvars \
+            -var-file=../../teams/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
             -out=tfplan \
             -detailed-exitcode \
             -input=false 2>&1 | tee plan.log

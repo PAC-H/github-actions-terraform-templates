@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Usage: ./scripts/new-team.sh <team-name> [2|4]
 #
-# Scaffolds a new team.yaml under teams/<team-name>/ from the template.
+# Scaffolds a new team folder under teams/<team-name>/ with:
+#   common.tfvars     — team-wide Terraform variables
+#   envs/<env>.tfvars — per-environment Terraform variables (one file per env)
+#
+# The set of environments is inferred from the filenames in envs/, so just
+# add or remove a file there to add or remove an environment.
+#
 # Pass 2 for a 2-environment team (staging + prod only).
 # Pass 4 (default) for a 4-environment team (dev + qa + staging + prod).
 set -euo pipefail
@@ -32,85 +38,58 @@ fi
 DEST_DIR="$REPO_ROOT/teams/$TEAM_NAME"
 
 if [[ -d "$DEST_DIR" ]]; then
-  echo "Error: teams/$TEAM_NAME already exists. Edit the existing team.yaml directly."
+  echo "Error: teams/$TEAM_NAME already exists. Edit the existing files directly."
   exit 1
 fi
 
-mkdir -p "$DEST_DIR"
-
 if [[ "$ENV_COUNT" == "4" ]]; then
-  ENVIRONMENTS="[dev, qa, staging, prod]"
-  ENV_BLOCKS=$(cat <<YAML
-
-azure:
-  per_env:
-    dev:
-      resource_group_name: "rg-${TEAM_NAME}-dev-databricks"
-      public_subnet_id: "REPLACE_WITH_DEV_PUBLIC_SUBNET_ID"
-      private_subnet_id: "REPLACE_WITH_DEV_PRIVATE_SUBNET_ID"
-      compliance_profile: standard
-
-    qa:
-      resource_group_name: "rg-${TEAM_NAME}-qa-databricks"
-      public_subnet_id: "REPLACE_WITH_QA_PUBLIC_SUBNET_ID"
-      private_subnet_id: "REPLACE_WITH_QA_PRIVATE_SUBNET_ID"
-      compliance_profile: standard
-
-    staging:
-      resource_group_name: "rg-${TEAM_NAME}-staging-databricks"
-      public_subnet_id: "REPLACE_WITH_STAGING_PUBLIC_SUBNET_ID"
-      private_subnet_id: "REPLACE_WITH_STAGING_PRIVATE_SUBNET_ID"
-      compliance_profile: enhanced
-
-    prod:
-      resource_group_name: "rg-${TEAM_NAME}-prod-databricks"
-      public_subnet_id: "REPLACE_WITH_PROD_PUBLIC_SUBNET_ID"
-      private_subnet_id: "REPLACE_WITH_PROD_PRIVATE_SUBNET_ID"
-      compliance_profile: enhanced
-YAML
-)
+  ENV_LIST=(dev qa staging prod)
 else
-  ENVIRONMENTS="[staging, prod]"
-  ENV_BLOCKS=$(cat <<YAML
-
-azure:
-  per_env:
-    staging:
-      resource_group_name: "rg-${TEAM_NAME}-staging-databricks"
-      public_subnet_id: "REPLACE_WITH_STAGING_PUBLIC_SUBNET_ID"
-      private_subnet_id: "REPLACE_WITH_STAGING_PRIVATE_SUBNET_ID"
-      compliance_profile: enhanced
-
-    prod:
-      resource_group_name: "rg-${TEAM_NAME}-prod-databricks"
-      public_subnet_id: "REPLACE_WITH_PROD_PUBLIC_SUBNET_ID"
-      private_subnet_id: "REPLACE_WITH_PROD_PRIVATE_SUBNET_ID"
-      compliance_profile: enhanced
-YAML
-)
+  ENV_LIST=(staging prod)
 fi
 
-cat > "$DEST_DIR/team.yaml" <<YAML
-name: ${TEAM_NAME}
-display_name: "REPLACE_WITH_DISPLAY_NAME"
-contact: "REPLACE_WITH_TEAM_EMAIL"
+mkdir -p "$DEST_DIR/envs"
 
-environments: ${ENVIRONMENTS}
+cat > "$DEST_DIR/common.tfvars" <<TFVARS
+team_name = "${TEAM_NAME}"
 
-databricks:
-  sku: premium
-  tags:
-    team: ${TEAM_NAME}
-    cost_center: "REPLACE_WITH_COST_CENTER"
-${ENV_BLOCKS}
-YAML
+# 'premium' is required if any environment uses compliance_profile = "enhanced".
+sku = "premium"
 
-echo "✓ Created teams/${TEAM_NAME}/team.yaml (${ENV_COUNT} environments)"
+tags = {
+  team        = "${TEAM_NAME}"
+  cost_center = "REPLACE_WITH_COST_CENTER"
+}
+TFVARS
+
+for env in "${ENV_LIST[@]}"; do
+  case "$env" in
+    dev|qa)        profile="standard" ;;
+    staging|prod)  profile="enhanced" ;;
+  esac
+
+  cat > "$DEST_DIR/envs/${env}.tfvars" <<TFVARS
+environment = "${env}"
+
+resource_group_name = "rg-${TEAM_NAME}-${env}-databricks"
+
+public_subnet_id  = "REPLACE_WITH_${env^^}_PUBLIC_SUBNET_ID"
+private_subnet_id = "REPLACE_WITH_${env^^}_PRIVATE_SUBNET_ID"
+
+compliance_profile = "${profile}"
+TFVARS
+done
+
+echo "✓ Created teams/${TEAM_NAME}/ (${ENV_COUNT} environments)"
+echo "    common.tfvars"
+for env in "${ENV_LIST[@]}"; do
+  echo "    envs/${env}.tfvars"
+done
 echo ""
 echo "Next steps:"
-echo "  1. Edit teams/${TEAM_NAME}/team.yaml and replace all REPLACE_WITH_* placeholders"
+echo "  1. Replace REPLACE_WITH_* placeholders in common.tfvars and envs/*.tfvars"
 echo "  2. Ensure subnets are pre-provisioned in Azure before applying"
-echo "  3. Push the file to trigger the CI/CD pipeline (or run manually via workflow_dispatch)"
+echo "  3. Push the files to trigger the CI/CD pipeline (or run manually via workflow_dispatch)"
 echo ""
 echo "Reminder:"
 echo "  • dev/qa environments auto-apply on merge to develop/main"
