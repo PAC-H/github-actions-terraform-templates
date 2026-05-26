@@ -1,262 +1,286 @@
-# =============================================================================
-# TERRAFORM COMPLIANCE PIPELINE
-# =============================================================================
-# This workflow provides comprehensive security and compliance validation for
-# Terraform infrastructure using multiple scanning tools:
-#
-# 1. TFLINT: Terraform-specific linting and best practices
-# 2. CHECKOV: Security vulnerability scanning and compliance checks
-# 3. AZURE POLICY: Live policy compliance validation against Azure policies
-#
-# Key Features:
-# - Multi-tool security scanning for comprehensive coverage
-# - PR integration with automatic compliance reports
-# - Azure Policy integration for live environment checking
-# - Artifact storage for compliance audit trails
-# - Teams notifications for compliance status
-# =============================================================================
+name: Terraform Compliance
 
-name: 'Terraform Compliance'
+# tflint + checkov + Azure Policy compliance check, per team × env.
+# PR trigger: scans every changed team's matrix. Manual: pick team + env (or 'all').
 
-# =============================================================================
-# TRIGGERS: PR validation + manual compliance checks
-# =============================================================================
 on:
   pull_request:
-    branches: [main, develop]      # Run compliance checks on all PRs
-    paths: ['terraform/**']        # Only when Terraform files are modified
-  workflow_dispatch:               # Manual execution for compliance audits
+    branches: [main, develop]
+    paths:
+      - 'terraform/**'
+      - 'config/teams/workspace/**'
+  workflow_dispatch:
     inputs:
-      environment:
-        description: 'Environment to check'
+      team:
+        description: "Team name or 'all'"
         required: true
-        type: choice
-        options:
-          - staging
-          - production
-          - all                    # Check all environments
+        default: 'all'
+      environment:
+        description: "Environment (dev|qa|staging|prod|all)"
+        required: true
+        default: 'all'
 
-# =============================================================================
-# PERMISSIONS: Enhanced permissions for PR comments and Azure access
-# =============================================================================
 permissions:
-  id-token: write       # Required for OIDC authentication
-  contents: read        # Read repository contents and configurations
-  pull-requests: write  # Comment on PRs with compliance results
+  id-token: write
+  contents: read
+  pull-requests: write
 
 jobs:
-  # ===========================================================================
-  # CONFIGURATION LOADING JOB
-  # ===========================================================================
-  # Standard configuration loading for consistent environment settings
-  # Note: Azure authentication credentials are now managed via GitHub Secrets
-  # ===========================================================================
-  load-config:
-    runs-on: self-hosted
+  _config:
+    name: Load Config
+    runs-on: [self-hosted, linux, x64]
     outputs:
-      base-config: ${{ steps.load-base.outputs.config }}
-      staging-config: ${{ steps.load-staging.outputs.config }}
-      production-config: ${{ steps.load-production.outputs.config }}
+      runners: ${{ steps.load.outputs.runners }}
     steps:
       - uses: actions/checkout@v4
-      
-      # Load shared configuration for notifications and Terraform versions
-      # Note: Azure credentials are now securely managed via GitHub Secrets
-      - name: Load base config
-        id: load-base
+      - id: load
         run: |
-          CONFIG=$(cat config/global/base.json | jq -c .)
-          echo "config=$CONFIG" >> $GITHUB_OUTPUT
-          
-      # Load environment-specific configurations for backend access
-      - name: Load staging config
-        id: load-staging
-        run: |
-          CONFIG=$(cat config/envs/staging.json | jq -c .)
-          echo "config=$CONFIG" >> $GITHUB_OUTPUT
-          
-      - name: Load production config
-        id: load-production
-        run: |
-          CONFIG=$(cat config/envs/production.json | jq -c .)
-          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          RUNNERS=$(jq -c '.runners.labels' config/global/base.json)
+          echo "runners=$RUNNERS" >> "$GITHUB_OUTPUT"
 
-  # ===========================================================================
-  # COMPLIANCE CHECK JOB
-  # ===========================================================================
-  # Performs comprehensive security and compliance scanning using:
-  # - TFLint for Terraform best practices and syntax issues
-  # - Checkov for security vulnerabilities and misconfigurations
-  # - Azure Policy for live environment policy compliance
-  #
-  # Uses matrix strategy to check multiple environments in parallel
-  # ===========================================================================
-  compliance-check:
-    runs-on: self-hosted
-    needs: load-config
-    strategy:
-      matrix:
-        # Dynamic environment selection based on input or default to both
-        environment: ${{ github.event.inputs.environment == 'all' && fromJson('["staging", "production"]') || github.event.inputs.environment && fromJson(format('["{0}"]', github.event.inputs.environment)) || fromJson('["staging", "production"]') }}
-    environment: ${{ matrix.environment }}  # Set environment context for proper secret access
+  build-matrix:
+    name: Build team/env matrix
+    needs: _config
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has-pairs: ${{ steps.matrix.outputs.has-pairs }}
     steps:
       - uses: actions/checkout@v4
-      
-      # Setup Terraform for plan generation and validation
+        with:
+          fetch-depth: 2
+      - id: matrix
+        env:
+          TEAM_INPUT: ${{ github.event.inputs.team || '' }}
+          ENV_INPUT: ${{ github.event.inputs.environment || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          pairs=()
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$TEAM_INPUT" == "all" ]]; then
+              teams=$(ls config/teams/workspace/ | grep -v '^_')
+            else
+              teams="$TEAM_INPUT"
+            fi
+          else
+            # PR trigger — derive from changed files; module changes queue all teams
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            changed=$(git diff --name-only "$base_sha" HEAD)
+            if echo "$changed" | grep -qE "^terraform/(modules/databricks-workspace|databricks)/"; then
+              teams=$(ls config/teams/workspace/ | grep -v '^_')
+            else
+              teams=$(echo "$changed" | grep "^config/teams/workspace/" | sed 's|config/teams/workspace/||;s|/.*||' | grep -v '^_' | sort -u || true)
+            fi
+          fi
+
+          for team in $teams; do
+            env_dir="config/teams/workspace/${team}/envs"
+            [[ -d "$env_dir" ]] || continue
+            all_envs=$(ls "$env_dir" 2>/dev/null | grep '\.tfvars$' | sed 's/\.tfvars$//' | sort)
+            if [[ "$EVENT_NAME" == "workflow_dispatch" && "$ENV_INPUT" != "all" ]]; then
+              envs="$ENV_INPUT"
+            else
+              envs="$all_envs"
+            fi
+            for env in $envs; do
+              echo "$all_envs" | grep -qx "$env" || continue
+              alias=$(jq -r ".env_to_subscription[\"$env\"] // empty" config/global/subscriptions.json)
+              [[ -n "$alias" ]] || continue
+              pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${alias}\"}")
+            done
+          done
+
+          if [[ ${#pairs[@]} -eq 0 ]]; then
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "has-pairs=false"          >> "$GITHUB_OUTPUT"
+          else
+            joined=$(IFS=,; echo "${pairs[*]}")
+            echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
+            echo "has-pairs=true"                    >> "$GITHUB_OUTPUT"
+          fi
+
+  compliance:
+    name: "Compliance · ${{ matrix.team }} / ${{ matrix.environment }}"
+    needs: [_config, build-matrix]
+    if: needs.build-matrix.outputs.has-pairs == 'true'
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
+    env:
+      AZURE_SUB_DEV_QA: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
+      AZURE_CLIENT_DEV_QA: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
+      AZURE_SUB_STAGING_PROD: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
+      AZURE_CLIENT_STAGING_PROD: ${{ secrets.AZURE_CLIENT_ID_STAGING_PROD }}
+      TF_SA_DEV_QA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_DEV_QA }}
+      TF_SA_STAGING_PROD: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
+      TF_RG_DEV_QA: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
+      TF_RG_STAGING_PROD: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve subscription credentials
+        id: sub
+        run: |
+          ALIAS="${{ matrix.subscription_alias }}"
+          if [[ "$ALIAS" == "dev-qa" ]]; then
+            echo "sub_id=$AZURE_SUB_DEV_QA"           >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_DEV_QA"     >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_DEV_QA"                   >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_DEV_QA"                   >> "$GITHUB_OUTPUT"
+          else
+            echo "sub_id=$AZURE_SUB_STAGING_PROD"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_STAGING_PROD" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+          fi
+          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/global/subscriptions.json)
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve resource group from tfvars
+        id: rg
+        env:
+          TEAM: ${{ matrix.team }}
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          # Pull resource_group_name out of the team's env tfvars
+          ENV_FILE="config/teams/workspace/${TEAM}/envs/${ENVIRONMENT}.tfvars"
+          RG=$(grep -E '^[[:space:]]*resource_group_name[[:space:]]*=' "$ENV_FILE" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/' || true)
+          echo "name=$RG" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ steps.sub.outputs.sub_id }}
+          client-id: ${{ steps.sub.outputs.client_id }}
+
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
-          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
-          working_directory: terraform/environments/${{ matrix.environment }}
+          working_directory: terraform/databricks
           environment: ${{ matrix.environment }}
-          
-      # Authenticate with Azure for policy compliance checks (environment-specific secrets)
-      - name: Azure Login
-        uses: ./.github/actions/azure-login
-        with:
-          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          client_id: ${{ secrets.AZURE_CLIENT_ID }}
-          
-      # Initialize Terraform to generate plan for compliance scanning
-      - name: Configure backend
-        working-directory: terraform/environments/${{ matrix.environment }}
+
+      - name: Terraform init
+        working-directory: terraform/databricks
+        env:
+          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
+          RESOURCE_GROUP: ${{ steps.sub.outputs.rg }}
+          CONTAINER: ${{ steps.sub.outputs.container }}
+          STATE_KEY: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
         run: |
-          # Initialize with environment-specific backend
-          ENV_CONFIG='${{ matrix.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
-          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
-          
           terraform init \
-            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
-            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
-            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
-            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
-            
-      # Generate plan for compliance analysis (in JSON format for tools)
-      - name: Generate plan for compliance check
-        working-directory: terraform/environments/${{ matrix.environment }}
+            -backend-config="storage_account_name=$STORAGE_ACCOUNT" \
+            -backend-config="container_name=$CONTAINER" \
+            -backend-config="resource_group_name=$RESOURCE_GROUP" \
+            -backend-config="key=$STATE_KEY"
+
+      - name: Terraform plan (for scanning)
+        working-directory: terraform/databricks
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
         run: |
-          terraform plan -out=compliance-plan-${{ matrix.environment }}
-          # Convert plan to JSON for security scanning tools
-          terraform show -json compliance-plan-${{ matrix.environment }} > compliance-plan-${{ matrix.environment }}.json
-          
-      # Install and run TFLint for Terraform best practices
+          terraform plan \
+            -var-file=../../config/teams/workspace/${{ matrix.team }}/common.tfvars \
+            -var-file=../../config/teams/workspace/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
+            -out=compliance.tfplan \
+            -input=false
+          terraform show -json compliance.tfplan > compliance.tfplan.json
+
       - name: Install tflint
         run: |
-          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
-          
-      - name: Run tflint security checks
-        working-directory: terraform/environments/${{ matrix.environment }}
+          curl -fsSL https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+
+      - name: Run tflint
+        working-directory: terraform/databricks
         run: |
-          # Initialize TFLint with latest rule definitions
           tflint --init
-          # Run TFLint and generate JSON report (continue on failures for reporting)
-          tflint --format json > tflint-report-${{ matrix.environment }}.json || true
-          
-      # Install and run Checkov for security vulnerability scanning
+          tflint --format json > tflint-report.json || true
+
       - name: Install checkov
+        run: pip3 install --quiet checkov
+
+      - name: Run checkov
+        working-directory: terraform/databricks
         run: |
-          pip3 install checkov
-          
-      - name: Run checkov security scan
-        working-directory: terraform/environments/${{ matrix.environment }}
+          checkov -f compliance.tfplan.json --framework terraform_plan --output json > checkov-report.json || true
+
+      - name: Azure Policy compliance
+        if: steps.rg.outputs.name != ''
+        env:
+          RG: ${{ steps.rg.outputs.name }}
         run: |
-          # Scan the Terraform plan for security issues and misconfigurations
-          checkov -f compliance-plan-${{ matrix.environment }}.json --framework terraform_plan --output json > checkov-report-${{ matrix.environment }}.json || true
-          
-      # Check live Azure Policy compliance for existing resources
-      - name: Check Azure Policy compliance
+          echo "Querying Azure Policy state for RG: $RG"
+          az policy state list \
+            --resource-group "$RG" \
+            --query '[].{policyDefinitionName: policyDefinitionName, complianceState: complianceState, resourceId: resourceId}' \
+            > policy-compliance.json || true
+
+      - name: Generate summary
+        working-directory: terraform/databricks
         run: |
-          echo "Checking Azure Policy compliance for ${{ matrix.environment }} environment..."
-          
-          # Query resource groups that match the environment naming pattern
-          RESOURCE_GROUPS=$(az group list --query "[?contains(name, '${{ matrix.environment }}')].name" -o tsv)
-          
-          # Initialize compliance report structure
-          echo '{"environment": "${{ matrix.environment }}", "policy_states": []}' > policy-compliance-${{ matrix.environment }}.json
-          
-          # Check policy compliance for each resource group
-          for rg in $RESOURCE_GROUPS; do
-            echo "Checking resource group: $rg"
-            # Query policy compliance state and append to temporary file
-            az policy state list --resource-group "$rg" --query '[].{policyDefinitionName: policyDefinitionName, complianceState: complianceState, resourceId: resourceId}' >> policy-states-temp.json || true
-          done
-          
-          # Merge policy states into main compliance report
-          if [ -f policy-states-temp.json ]; then
-            jq '.policy_states += input' policy-compliance-${{ matrix.environment }}.json policy-states-temp.json > temp.json
-            mv temp.json policy-compliance-${{ matrix.environment }}.json
-            rm policy-states-temp.json
-          fi
-          
-      # Generate comprehensive compliance summary report
-      - name: Generate compliance summary
-        run: |
-          # Create markdown report combining all compliance check results
-          cat > compliance-summary-${{ matrix.environment }}.md << EOF
-          # Compliance Report - ${{ matrix.environment }} Environment
-          
-          ## TFLint Security Checks
-          \`\`\`json
-          $(cat terraform/environments/${{ matrix.environment }}/tflint-report-${{ matrix.environment }}.json 2>/dev/null || echo "{}")
-          \`\`\`
-          
-          ## Checkov Security Scan
-          \`\`\`json
-          $(cat terraform/environments/${{ matrix.environment }}/checkov-report-${{ matrix.environment }}.json 2>/dev/null || echo "{}")
-          \`\`\`
-          
-          ## Azure Policy Compliance
-          \`\`\`json
-          $(cat policy-compliance-${{ matrix.environment }}.json 2>/dev/null || echo "{}")
-          \`\`\`
-          
-          ## Summary
-          - **Environment**: ${{ matrix.environment }}
-          - **Scan Date**: $(date)
-          - **Repository**: ${{ github.repository }}
-          - **Commit**: ${{ github.sha }}
-          EOF
-          
-      # Store all compliance reports as artifacts for audit trail
-      - name: Upload compliance reports
+          SUMMARY="compliance-summary-${{ matrix.team }}-${{ matrix.environment }}.md"
+          {
+            echo "# Compliance Report — ${{ matrix.team }} / ${{ matrix.environment }}"
+            echo ""
+            echo "- Repo: ${{ github.repository }}"
+            echo "- Commit: ${{ github.sha }}"
+            echo "- Scan date: $(date -u)"
+            echo ""
+            echo "## tflint"
+            echo '```json'
+            cat tflint-report.json 2>/dev/null || echo '{}'
+            echo '```'
+            echo ""
+            echo "## checkov"
+            echo '```json'
+            cat checkov-report.json 2>/dev/null || echo '{}'
+            echo '```'
+            echo ""
+            echo "## Azure Policy"
+            echo '```json'
+            cat ../../policy-compliance.json 2>/dev/null || echo '[]'
+            echo '```'
+          } > "$SUMMARY"
+
+      - name: Upload reports
         uses: actions/upload-artifact@v4
         with:
-          name: compliance-report-${{ matrix.environment }}
+          name: compliance-${{ matrix.team }}-${{ matrix.environment }}
           path: |
-            terraform/environments/${{ matrix.environment }}/tflint-report-${{ matrix.environment }}.json
-            terraform/environments/${{ matrix.environment }}/checkov-report-${{ matrix.environment }}.json
-            policy-compliance-${{ matrix.environment }}.json
-            compliance-summary-${{ matrix.environment }}.md
+            terraform/databricks/tflint-report.json
+            terraform/databricks/checkov-report.json
+            terraform/databricks/compliance-summary-${{ matrix.team }}-${{ matrix.environment }}.md
+            policy-compliance.json
+          if-no-files-found: ignore
           retention-days: 30
-          
-      # Post compliance summary as PR comment for visibility
-      - name: Comment PR with compliance results
+
+      - name: PR comment
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
+            const path = `terraform/databricks/compliance-summary-${{ matrix.team }}-${{ matrix.environment }}.md`;
             try {
-              // Read the generated compliance summary
-              const summary = fs.readFileSync('compliance-summary-${{ matrix.environment }}.md', 'utf8');
-              // Post as comment on the PR
-              github.rest.issues.createComment({
+              const body = fs.readFileSync(path, 'utf8');
+              await github.rest.issues.createComment({
                 issue_number: context.issue.number,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                body: summary
+                body,
               });
-            } catch (error) {
-              console.log('Could not read compliance summary file');
+            } catch (e) {
+              core.warning(`Could not read ${path}: ${e.message}`);
             }
-            
-      # Notify team of compliance check completion
-      - name: Notify compliance results
-        if: fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
-        uses: ./.github/actions/teams-notification
-        with:
-          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
-          status: success
-          environment: ${{ matrix.environment }}
-          message: "Compliance check completed for ${{ matrix.environment }}. Check artifacts for detailed results." 

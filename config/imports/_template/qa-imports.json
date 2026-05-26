@@ -1,0 +1,8 @@
+{
+  "imports": [
+    {
+      "resource_address": "module.databricks_workspace.azurerm_databricks_workspace.this",
+      "resource_id": "/subscriptions/REPLACE_WITH_SUBSCRIPTION_ID/resourceGroups/REPLACE_WITH_RG/providers/Microsoft.Databricks/workspaces/REPLACE_WITH_WORKSPACE"
+    }
+  ]
+}

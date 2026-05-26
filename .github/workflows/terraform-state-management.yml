@@ -1,355 +1,408 @@
-# =============================================================================
-# TERRAFORM STATE MANAGEMENT PIPELINE
-# =============================================================================
-# This workflow provides critical state management operations for Terraform:
-#
-# 1. UNLOCK OPERATION: Force-unlock stuck Terraform state files
-# 2. BACKUP OPERATION: Create timestamped backups of state files
-# 3. RESTORE OPERATION: Restore state files from previous backups
-# 4. LIST OPERATION: List all resources in Terraform state
-# 5. SHOW OPERATION: Show detailed information about specific resource
-# 6. REMOVE OPERATION: Remove resource from state without destroying it
-#
-# CRITICAL SAFETY NOTES:
-# - These operations directly manipulate Terraform state files
-# - Improper use can cause data loss or infrastructure corruption
-# - Always ensure you have recent backups before performing operations
-# - Test restore operations in non-production environments first
-# - REMOVE operation creates automatic backup before execution
-# =============================================================================
+name: Terraform State Management
 
-name: 'Terraform State Management'
+# Manual state operations for the multi-team Databricks workspaces:
+#   unlock | list | show | remove | backup | restore
+# All ops target a single {team, environment} except `backup`, which on schedule
+# iterates every team × env under config/teams/workspace/.
 
-# =============================================================================
-# TRIGGERS: Manual operations + automated weekly backups
-# =============================================================================
 on:
-  workflow_dispatch:  # Manual execution with operation selection
+  workflow_dispatch:
     inputs:
       operation:
-        description: 'State operation to perform'
+        description: 'State operation'
         required: true
         type: choice
         options:
-          - unlock    # Force unlock stuck state file
-          - backup    # Create manual backup of state files
-          - restore   # Restore state from backup
-          - list      # List all resources in state
-          - show      # Show detailed information about specific resource
-          - remove    # Remove resource from state without destroying
-      environment:
-        description: 'Environment'
-        required: true
-        type: choice
-        options:
-          - staging
-          - production
-      lock_id:
-        description: 'Lock ID (required for unlock operation)'
+          - unlock
+          - list
+          - show
+          - remove
+          - backup
+          - restore
+      team:
+        description: "Team name (folder under config/teams/workspace/). Ignored for scheduled backup."
         required: false
-      backup_name:
-        description: 'Backup name (required for restore operation)'
+      environment:
+        description: 'Environment (dev|qa|staging|prod)'
+        required: false
+        type: choice
+        options:
+          - dev
+          - qa
+          - staging
+          - prod
+      lock_id:
+        description: 'Lock ID (required for unlock)'
         required: false
       resource_address:
-        description: 'Resource address (required for show and remove operations, e.g., azurerm_resource_group.main)'
+        description: 'Resource address (required for show/remove, e.g. azurerm_databricks_workspace.this)'
+        required: false
+      backup_name:
+        description: 'Backup blob name (required for restore)'
         required: false
   schedule:
-    - cron: '0 2 * * 0'  # Weekly backup on Sundays at 2 AM UTC (off-peak hours)
+    - cron: '0 2 * * 0'  # Weekly backup, Sundays 02:00 UTC
 
-# =============================================================================
-# PERMISSIONS: Enhanced permissions needed for state operations
-# =============================================================================
 permissions:
-  id-token: write  # Required for OIDC authentication
-  contents: read   # Read repository contents and configurations
+  id-token: write
+  contents: read
 
 jobs:
-  # ===========================================================================
-  # CONFIGURATION LOADING JOB
-  # ===========================================================================
-  # Loads environment configurations and backup storage settings
-  # Critical for proper state file location and backup destinations
-  # Note: Azure authentication credentials are now managed via GitHub Secrets
-  # ===========================================================================
-  load-config:
-    runs-on: self-hosted
+  _config:
+    name: Load Config
+    runs-on: [self-hosted, linux, x64]
     outputs:
-      base-config: ${{ steps.load-base.outputs.config }}
-      staging-config: ${{ steps.load-staging.outputs.config }}
-      production-config: ${{ steps.load-production.outputs.config }}
+      runners: ${{ steps.load.outputs.runners }}
+      backup_account: ${{ steps.load.outputs.backup_account }}
+      backup_container: ${{ steps.load.outputs.backup_container }}
     steps:
       - uses: actions/checkout@v4
-      
-      # Load base config containing backup storage account details and notification settings
-      # Note: Azure credentials are now securely managed via GitHub Secrets
-      - name: Load base config
-        id: load-base
+      - id: load
         run: |
-          CONFIG=$(cat config/global/base.json | jq -c .)
-          echo "config=$CONFIG" >> $GITHUB_OUTPUT
-          
-      # Load environment-specific state storage configurations
-      - name: Load staging config
-        id: load-staging
-        run: |
-          CONFIG=$(cat config/envs/staging.json | jq -c .)
-          echo "config=$CONFIG" >> $GITHUB_OUTPUT
-          
-      - name: Load production config
-        id: load-production
-        run: |
-          CONFIG=$(cat config/envs/production.json | jq -c .)
-          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          RUNNERS=$(jq -c '.runners.labels' config/global/base.json)
+          BACKUP_ACCOUNT=$(jq -r '.storage.backup_account' config/global/base.json)
+          BACKUP_CONTAINER=$(jq -r '.storage.backup_container' config/global/base.json)
+          echo "runners=$RUNNERS"               >> "$GITHUB_OUTPUT"
+          echo "backup_account=$BACKUP_ACCOUNT" >> "$GITHUB_OUTPUT"
+          echo "backup_container=$BACKUP_CONTAINER" >> "$GITHUB_OUTPUT"
 
-  # ===========================================================================
-  # STATE MANAGEMENT JOB
-  # ===========================================================================
-  # Performs critical Terraform state operations with comprehensive safety measures:
-  # - State unlock: Remove stuck locks safely
-  # - State backup: Create timestamped backups for recovery
-  # - State restore: Restore from previous backups when needed
-  # 
-  # SAFETY: All operations require environment approval for production
-  # ===========================================================================
-  state-operation:
-    runs-on: self-hosted
-    needs: load-config
-    environment: ${{ github.event.inputs.environment || 'staging' }}  # Set environment context for proper secret access
+  # ───────────────────────────────────────────────────────────────────────────
+  # Single-slice operations: unlock | list | show | remove | restore + manual backup
+  # ───────────────────────────────────────────────────────────────────────────
+  state-op:
+    name: "State · ${{ github.event.inputs.operation }} · ${{ github.event.inputs.team }} / ${{ github.event.inputs.environment }}"
+    if: github.event_name == 'workflow_dispatch'
+    needs: _config
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    environment: ${{ (github.event.inputs.environment == 'staging' || github.event.inputs.environment == 'prod') && format('databricks-{0}', github.event.inputs.environment) || '' }}
+    env:
+      AZURE_SUB_DEV_QA: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
+      AZURE_CLIENT_DEV_QA: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
+      AZURE_SUB_STAGING_PROD: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
+      AZURE_CLIENT_STAGING_PROD: ${{ secrets.AZURE_CLIENT_ID_STAGING_PROD }}
+      TF_SA_DEV_QA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_DEV_QA }}
+      TF_SA_STAGING_PROD: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
+      TF_RG_DEV_QA: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
+      TF_RG_STAGING_PROD: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
+
     steps:
       - uses: actions/checkout@v4
-      
-      # Setup Terraform for state operations
+
+      - name: Validate inputs
+        env:
+          OP: ${{ github.event.inputs.operation }}
+          TEAM: ${{ github.event.inputs.team }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ -n "$TEAM" ]] || fail "team input is required"
+          [[ -n "$ENVIRONMENT" ]] || fail "environment input is required"
+
+          case "$OP" in
+            unlock)
+              [[ -n "${{ github.event.inputs.lock_id }}" ]]          || fail "lock_id required for unlock"
+              ;;
+            show|remove)
+              [[ -n "${{ github.event.inputs.resource_address }}" ]] || fail "resource_address required for $OP"
+              ;;
+            restore)
+              [[ -n "${{ github.event.inputs.backup_name }}" ]]      || fail "backup_name required for restore"
+              ;;
+          esac
+
+          TEAM_DIR="config/teams/workspace/${TEAM}"
+          ENV_FILE="${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars"
+          [[ -f "${TEAM_DIR}/common.tfvars" ]] || fail "missing ${TEAM_DIR}/common.tfvars"
+          [[ -f "$ENV_FILE" ]]                 || fail "missing $ENV_FILE"
+
+      - name: Resolve subscription credentials
+        id: sub
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+        run: |
+          ALIAS=$(jq -r ".env_to_subscription[\"$ENVIRONMENT\"]" config/global/subscriptions.json)
+          if [[ "$ALIAS" == "dev-qa" ]]; then
+            echo "sub_id=$AZURE_SUB_DEV_QA"           >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_DEV_QA"     >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_DEV_QA"                   >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_DEV_QA"                   >> "$GITHUB_OUTPUT"
+          else
+            echo "sub_id=$AZURE_SUB_STAGING_PROD"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_STAGING_PROD" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+          fi
+          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/global/subscriptions.json)
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+          echo "alias=$ALIAS"         >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ steps.sub.outputs.sub_id }}
+          client-id: ${{ steps.sub.outputs.client_id }}
+
       - name: Setup Terraform
+        if: github.event.inputs.operation != 'restore'
         uses: ./.github/actions/setup-terraform
         with:
-          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
-          working_directory: terraform/environments/${{ github.event.inputs.environment || 'staging' }}
-          environment: ${{ github.event.inputs.environment || 'staging' }}
-          
-      # Authenticate with Azure for state operations (environment-specific secrets)
-      - name: Azure Login
-        uses: ./.github/actions/azure-login
-        with:
-          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          client_id: ${{ secrets.AZURE_CLIENT_ID }}
-          
-      # UNLOCK OPERATION: Force remove Terraform state lock
-      - name: Unlock state
+          working_directory: terraform/databricks
+          environment: ${{ github.event.inputs.environment }}
+
+      - name: Terraform init
+        if: github.event.inputs.operation != 'restore'
+        working-directory: terraform/databricks
+        env:
+          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
+          RESOURCE_GROUP: ${{ steps.sub.outputs.rg }}
+          CONTAINER: ${{ steps.sub.outputs.container }}
+          STATE_KEY: "workspace/${{ github.event.inputs.team }}/${{ github.event.inputs.environment }}.tfstate"
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+        run: |
+          terraform init \
+            -backend-config="storage_account_name=$STORAGE_ACCOUNT" \
+            -backend-config="container_name=$CONTAINER" \
+            -backend-config="resource_group_name=$RESOURCE_GROUP" \
+            -backend-config="key=$STATE_KEY"
+
+      - name: Unlock
         if: github.event.inputs.operation == 'unlock'
-        working-directory: terraform/environments/${{ github.event.inputs.environment }}
-        run: |
-          # Initialize Terraform to access the locked state
-          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
-          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
-          
-          terraform init \
-            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
-            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
-            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
-            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
-            
-          # Force unlock using the provided lock ID
-          terraform force-unlock ${{ github.event.inputs.lock_id }}
-          
-      # INPUT VALIDATION: Validate required inputs for show and remove operations
-      - name: Validate resource address
-        if: github.event.inputs.operation == 'show' || github.event.inputs.operation == 'remove'
-        run: |
-          if [ -z "${{ github.event.inputs.resource_address }}" ]; then
-            echo "❌ Error: resource_address is required for ${{ github.event.inputs.operation }} operation"
-            echo "Example: azurerm_resource_group.main"
-            exit 1
-          fi
-          
-      # LIST OPERATION: List all resources in Terraform state
-      - name: List state resources
+        working-directory: terraform/databricks
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+        run: terraform force-unlock -force "${{ github.event.inputs.lock_id }}"
+
+      - name: List
         if: github.event.inputs.operation == 'list'
-        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        working-directory: terraform/databricks
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
         run: |
-          # Initialize Terraform to access state
-          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
-          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
-          
-          terraform init \
-            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
-            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
-            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
-            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
-            
-          echo "📋 Listing all resources in ${{ github.event.inputs.environment }} state:"
-          terraform state list > state-list-${{ github.event.inputs.environment }}.txt
-          
-          # Display list and count
-          RESOURCE_COUNT=$(wc -l < state-list-${{ github.event.inputs.environment }}.txt)
-          echo "Found $RESOURCE_COUNT resources in state:"
-          cat state-list-${{ github.event.inputs.environment }}.txt
-          
-      # SHOW OPERATION: Show detailed information about specific resource
-      - name: Show resource details
+          OUT="state-list-${{ github.event.inputs.team }}-${{ github.event.inputs.environment }}.txt"
+          terraform state list | tee "$OUT"
+
+      - name: Show
         if: github.event.inputs.operation == 'show'
-        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        working-directory: terraform/databricks
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
         run: |
-          # Initialize Terraform to access state
-          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
-          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
-          
-          terraform init \
-            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
-            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
-            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
-            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
-            
-          # Check if resource exists in state first
-          if ! terraform state list | grep -q "^${{ github.event.inputs.resource_address }}$"; then
-            echo "❌ Error: Resource '${{ github.event.inputs.resource_address }}' not found in state"
-            echo "Available resources:"
-            terraform state list
-            exit 1
-          fi
-          
-          echo "🔍 Showing details for resource: ${{ github.event.inputs.resource_address }}"
-          terraform state show "${{ github.event.inputs.resource_address }}" > resource-details-${{ github.event.inputs.environment }}.txt
-          cat resource-details-${{ github.event.inputs.environment }}.txt
-          
-      # REMOVE OPERATION: Remove resource from state without destroying (with safety backup)
-      - name: Remove resource from state
+          OUT="state-show-${{ github.event.inputs.team }}-${{ github.event.inputs.environment }}.txt"
+          terraform state show "${{ github.event.inputs.resource_address }}" | tee "$OUT"
+
+      - name: Remove (with safety backup)
         if: github.event.inputs.operation == 'remove'
-        working-directory: terraform/environments/${{ github.event.inputs.environment }}
+        working-directory: terraform/databricks
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
         run: |
-          # Initialize Terraform to access state
-          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
-          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
-          
-          terraform init \
-            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
-            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
-            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
-            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
-            
-          # Check if resource exists in state first
-          if ! terraform state list | grep -q "^${{ github.event.inputs.resource_address }}$"; then
-            echo "❌ Error: Resource '${{ github.event.inputs.resource_address }}' not found in state"
-            echo "Available resources:"
+          set -euo pipefail
+          if ! terraform state list | grep -qx "${{ github.event.inputs.resource_address }}"; then
+            echo "::error::Resource not in state"
             terraform state list
             exit 1
           fi
-          
-          # Create safety backup before removal
-          echo "🔐 Creating safety backup before removal..."
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          terraform state pull > pre-removal-backup-${TIMESTAMP}.tfstate
-          
-          # Show resource details before removal for audit trail
-          echo "📋 Resource details before removal:"
-          terraform state show "${{ github.event.inputs.resource_address }}" > removed-resource-details-${TIMESTAMP}.txt
-          cat removed-resource-details-${TIMESTAMP}.txt
-          
-          # Perform the removal
-          echo "🗑️ Removing resource from state: ${{ github.event.inputs.resource_address }}"
+          TS=$(date +%Y%m%d-%H%M%S)
+          terraform state pull > "pre-remove-${TS}.tfstate"
+          terraform state show "${{ github.event.inputs.resource_address }}" > "removed-${TS}.txt"
           terraform state rm "${{ github.event.inputs.resource_address }}"
-          
-          # Verify removal
-          echo "✅ Resource removed. Current state contains:"
           terraform state list
-          
-      # Upload state operation artifacts
-      - name: Upload operation artifacts
-        if: github.event.inputs.operation == 'list' || github.event.inputs.operation == 'show' || github.event.inputs.operation == 'remove'
-        uses: actions/upload-artifact@v4
-        with:
-          name: state-operation-${{ github.event.inputs.operation }}-${{ github.event.inputs.environment }}
-          path: |
-            terraform/environments/${{ github.event.inputs.environment }}/state-list-*.txt
-            terraform/environments/${{ github.event.inputs.environment }}/resource-details-*.txt
-            terraform/environments/${{ github.event.inputs.environment }}/pre-removal-backup-*.tfstate
-            terraform/environments/${{ github.event.inputs.environment }}/removed-resource-details-*.txt
-          retention-days: 30
-          
-      # BACKUP OPERATION: Create timestamped backups of all state files
-      - name: Backup state files
-        if: github.event.inputs.operation == 'backup' || github.event_name == 'schedule'
+
+      - name: Manual backup (single slice)
+        if: github.event.inputs.operation == 'backup'
+        env:
+          BACKUP_ACCOUNT: ${{ needs._config.outputs.backup_account }}
+          BACKUP_CONTAINER: ${{ needs._config.outputs.backup_container }}
+          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
+          CONTAINER: ${{ steps.sub.outputs.container }}
         run: |
-          # Create unique timestamp for this backup
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          
-          # Download and backup staging state file
-          STAGING_CONFIG='${{ needs.load-config.outputs.staging-config }}'
-          STAGING_BACKEND=$(echo $STAGING_CONFIG | jq -r '.terraform.backend')
-          
+          set -euo pipefail
+          TS=$(date +%Y%m%d-%H%M%S)
+          KEY="workspace/${{ github.event.inputs.team }}/${{ github.event.inputs.environment }}.tfstate"
+          OUT="${{ github.event.inputs.team }}-${{ github.event.inputs.environment }}-${TS}.tfstate"
+
           az storage blob download \
-            --account-name $(echo $STAGING_BACKEND | jq -r '.storage_account_name') \
-            --container-name $(echo $STAGING_BACKEND | jq -r '.container_name') \
-            --name $(echo $STAGING_BACKEND | jq -r '.key') \
-            --file staging-${TIMESTAMP}.tfstate
-            
-          # Download and backup production state file
-          PRODUCTION_CONFIG='${{ needs.load-config.outputs.production-config }}'
-          PRODUCTION_BACKEND=$(echo $PRODUCTION_CONFIG | jq -r '.terraform.backend')
-          
-          az storage blob download \
-            --account-name $(echo $PRODUCTION_BACKEND | jq -r '.storage_account_name') \
-            --container-name $(echo $PRODUCTION_BACKEND | jq -r '.container_name') \
-            --name $(echo $PRODUCTION_BACKEND | jq -r '.key') \
-            --file production-${TIMESTAMP}.tfstate
-            
-          # Upload both backups to the designated backup storage account
-          BASE_CONFIG='${{ needs.load-config.outputs.base-config }}'
-          BACKUP_STORAGE=$(echo $BASE_CONFIG | jq -r '.storage')
-          
+            --auth-mode login \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CONTAINER" \
+            --name "$KEY" \
+            --file "$OUT"
+
           az storage blob upload \
-            --account-name $(echo $BACKUP_STORAGE | jq -r '.backup_account') \
-            --container-name $(echo $BACKUP_STORAGE | jq -r '.backup_container') \
-            --name staging-${TIMESTAMP}.tfstate \
-            --file staging-${TIMESTAMP}.tfstate
-            
-          az storage blob upload \
-            --account-name $(echo $BACKUP_STORAGE | jq -r '.backup_account') \
-            --container-name $(echo $BACKUP_STORAGE | jq -r '.backup_container') \
-            --name production-${TIMESTAMP}.tfstate \
-            --file production-${TIMESTAMP}.tfstate
-            
-      # RESTORE OPERATION: Restore state file from backup (DANGEROUS!)
-      - name: Restore state file
+            --auth-mode login \
+            --account-name "$BACKUP_ACCOUNT" \
+            --container-name "$BACKUP_CONTAINER" \
+            --name "$OUT" \
+            --file "$OUT"
+
+      - name: Restore
         if: github.event.inputs.operation == 'restore'
+        env:
+          BACKUP_ACCOUNT: ${{ needs._config.outputs.backup_account }}
+          BACKUP_CONTAINER: ${{ needs._config.outputs.backup_container }}
+          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
+          CONTAINER: ${{ steps.sub.outputs.container }}
         run: |
-          # Download the specified backup file
-          BASE_CONFIG='${{ needs.load-config.outputs.base-config }}'
-          BACKUP_STORAGE=$(echo $BASE_CONFIG | jq -r '.storage')
-          
+          set -euo pipefail
+          KEY="workspace/${{ github.event.inputs.team }}/${{ github.event.inputs.environment }}.tfstate"
+
           az storage blob download \
-            --account-name $(echo $BACKUP_STORAGE | jq -r '.backup_account') \
-            --container-name $(echo $BACKUP_STORAGE | jq -r '.backup_container') \
-            --name ${{ github.event.inputs.backup_name }} \
+            --auth-mode login \
+            --account-name "$BACKUP_ACCOUNT" \
+            --container-name "$BACKUP_CONTAINER" \
+            --name "${{ github.event.inputs.backup_name }}" \
             --file restored.tfstate
-            
-          # Overwrite the current state file with the backup
-          ENV_CONFIG='${{ github.event.inputs.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
-          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
-          
+
           az storage blob upload \
-            --account-name $(echo $BACKEND_CONFIG | jq -r '.storage_account_name') \
-            --container-name $(echo $BACKEND_CONFIG | jq -r '.container_name') \
-            --name $(echo $BACKEND_CONFIG | jq -r '.key') \
+            --auth-mode login \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CONTAINER" \
+            --name "$KEY" \
             --file restored.tfstate \
             --overwrite
-            
-      # Notify team of successful state operation
-      - name: Notify success
-        if: success() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
+
+      - name: Upload artifacts
+        if: always() && github.event.inputs.operation != 'restore' && github.event.inputs.operation != 'unlock'
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-${{ github.event.inputs.operation }}-${{ github.event.inputs.team }}-${{ github.event.inputs.environment }}-${{ github.run_number }}
+          path: |
+            terraform/databricks/state-list-*.txt
+            terraform/databricks/state-show-*.txt
+            terraform/databricks/pre-remove-*.tfstate
+            terraform/databricks/removed-*.txt
+            *.tfstate
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Notify
+        if: always()
         uses: ./.github/actions/teams-notification
         with:
-          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
-          status: success
-          environment: ${{ github.event.inputs.environment || 'all' }}
-          message: "State ${{ github.event.inputs.operation || 'backup' }} operation completed successfully${{ github.event.inputs.operation == 'remove' && format(' - Resource {0} removed from state', github.event.inputs.resource_address) || '' }}"
-          
-      # Critical: Alert team immediately if state operation fails
-      - name: Notify failure
-        if: failure() && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
-        uses: ./.github/actions/teams-notification
+          webhook_url: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          status: ${{ job.status }}
+          environment: "${{ github.event.inputs.team }} / ${{ github.event.inputs.environment }}"
+          message: "State ${{ github.event.inputs.operation }} ${{ job.status }}"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Scheduled weekly backup: iterates every team × env
+  # ───────────────────────────────────────────────────────────────────────────
+  build-backup-matrix:
+    name: Build backup matrix
+    if: github.event_name == 'schedule'
+    needs: _config
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has-pairs: ${{ steps.matrix.outputs.has-pairs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: matrix
+        run: |
+          set -euo pipefail
+          pairs=()
+          for team_dir in config/teams/workspace/*/; do
+            team=$(basename "$team_dir")
+            [[ "$team" == _* ]] && continue
+            env_dir="${team_dir}envs"
+            [[ -d "$env_dir" ]] || continue
+            for env_file in "$env_dir"/*.tfvars; do
+              [[ -e "$env_file" ]] || continue
+              env=$(basename "$env_file" .tfvars)
+              alias=$(jq -r ".env_to_subscription[\"$env\"] // empty" config/global/subscriptions.json)
+              [[ -n "$alias" ]] || continue
+              pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${alias}\"}")
+            done
+          done
+          if [[ ${#pairs[@]} -eq 0 ]]; then
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "has-pairs=false"          >> "$GITHUB_OUTPUT"
+          else
+            joined=$(IFS=,; echo "${pairs[*]}")
+            echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
+            echo "has-pairs=true"                    >> "$GITHUB_OUTPUT"
+          fi
+
+  scheduled-backup:
+    name: "Backup · ${{ matrix.team }} / ${{ matrix.environment }}"
+    if: github.event_name == 'schedule' && needs.build-backup-matrix.outputs.has-pairs == 'true'
+    needs: [_config, build-backup-matrix]
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.build-backup-matrix.outputs.matrix) }}
+    env:
+      AZURE_SUB_DEV_QA: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
+      AZURE_CLIENT_DEV_QA: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
+      AZURE_SUB_STAGING_PROD: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
+      AZURE_CLIENT_STAGING_PROD: ${{ secrets.AZURE_CLIENT_ID_STAGING_PROD }}
+      TF_SA_DEV_QA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_DEV_QA }}
+      TF_SA_STAGING_PROD: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve subscription credentials
+        id: sub
+        run: |
+          ALIAS="${{ matrix.subscription_alias }}"
+          if [[ "$ALIAS" == "dev-qa" ]]; then
+            echo "sub_id=$AZURE_SUB_DEV_QA"           >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_DEV_QA"     >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_DEV_QA"                   >> "$GITHUB_OUTPUT"
+          else
+            echo "sub_id=$AZURE_SUB_STAGING_PROD"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_STAGING_PROD" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+          fi
+          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/global/subscriptions.json)
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
         with:
-          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
-          status: failure
-          environment: ${{ github.event.inputs.environment || 'all' }}
-          message: "State ${{ github.event.inputs.operation || 'backup' }} operation failed${{ github.event.inputs.operation == 'remove' && format(' - Resource {0} removal failed', github.event.inputs.resource_address) || '' }}" 
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ steps.sub.outputs.sub_id }}
+          client-id: ${{ steps.sub.outputs.client_id }}
+
+      - name: Copy state to backup container
+        env:
+          BACKUP_ACCOUNT: ${{ needs._config.outputs.backup_account }}
+          BACKUP_CONTAINER: ${{ needs._config.outputs.backup_container }}
+          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
+          CONTAINER: ${{ steps.sub.outputs.container }}
+        run: |
+          set -euo pipefail
+          TS=$(date +%Y%m%d-%H%M%S)
+          KEY="workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
+          OUT="${{ matrix.team }}-${{ matrix.environment }}-${TS}.tfstate"
+
+          az storage blob download \
+            --auth-mode login \
+            --account-name "$STORAGE_ACCOUNT" \
+            --container-name "$CONTAINER" \
+            --name "$KEY" \
+            --file "$OUT" || { echo "::warning::No state at $KEY, skipping"; exit 0; }
+
+          az storage blob upload \
+            --auth-mode login \
+            --account-name "$BACKUP_ACCOUNT" \
+            --container-name "$BACKUP_CONTAINER" \
+            --name "$OUT" \
+            --file "$OUT"

@@ -1,168 +1,181 @@
-# =============================================================================
-# TERRAFORM DRIFT DETECTION PIPELINE
-# =============================================================================
-# This workflow automatically detects infrastructure drift by comparing the
-# current state of resources in Azure with the expected state defined in
-# Terraform configurations. It runs weekly but can also be triggered manually.
-#
-# Key Features:
-# - Automated weekly execution (Sundays at 9 AM UTC)
-# - Parallel drift detection for both staging and production
-# - Detailed drift reports saved as artifacts
-# - Teams notifications for drift alerts
-# - Non-destructive - only detects changes, doesn't fix them
-# =============================================================================
+name: Terraform Drift Detection
 
-name: 'Terraform Drift Detection'
+# Detects drift across every team × environment under config/teams/workspace/
+# by running `terraform plan -detailed-exitcode` against the live backend.
+# Runs weekly + on demand. Non-destructive.
 
-# =============================================================================
-# TRIGGERS: Scheduled weekly runs + manual execution
-# =============================================================================
 on:
   schedule:
-    - cron: '0 9 * * 0'  # Weekly on Sundays at 9 AM UTC (adjust timezone as needed)
-  workflow_dispatch:      # Allow manual triggering for immediate drift checks
+    - cron: '0 9 * * 0'  # Sundays 09:00 UTC
+  workflow_dispatch:
 
-# =============================================================================
-# PERMISSIONS: Required for Azure OIDC authentication
-# =============================================================================
 permissions:
-  id-token: write  # Required for OIDC token generation
-  contents: read   # Read repository contents and configurations
+  id-token: write
+  contents: read
 
 jobs:
-  # ===========================================================================
-  # CONFIGURATION LOADING JOB
-  # ===========================================================================
-  # Same configuration loading pattern as main deployment workflow
-  # to ensure consistent environment settings across all pipelines
-  # Note: Azure authentication credentials are now managed via GitHub Secrets
-  # ===========================================================================
-  load-config:
-    runs-on: self-hosted
+  _config:
+    name: Load Config
+    runs-on: [self-hosted, linux, x64]
     outputs:
-      base-config: ${{ steps.load-base.outputs.config }}
-      staging-config: ${{ steps.load-staging.outputs.config }}
-      production-config: ${{ steps.load-production.outputs.config }}
+      runners: ${{ steps.load.outputs.runners }}
     steps:
       - uses: actions/checkout@v4
-      
-      # Load shared configuration (notification settings, Terraform versions)
-      # Note: Azure credentials are now securely managed via GitHub Secrets
-      - name: Load base config
-        id: load-base
+      - id: load
         run: |
-          CONFIG=$(cat config/global/base.json | jq -c .)
-          echo "config=$CONFIG" >> $GITHUB_OUTPUT
-          
-      # Load environment-specific backend configurations
-      - name: Load staging config
-        id: load-staging
-        run: |
-          CONFIG=$(cat config/envs/staging.json | jq -c .)
-          echo "config=$CONFIG" >> $GITHUB_OUTPUT
-          
-      - name: Load production config
-        id: load-production
-        run: |
-          CONFIG=$(cat config/envs/production.json | jq -c .)
-          echo "config=$CONFIG" >> $GITHUB_OUTPUT
+          RUNNERS=$(jq -c '.runners.labels' config/global/base.json)
+          echo "runners=$RUNNERS" >> "$GITHUB_OUTPUT"
 
-  # ===========================================================================
-  # DRIFT DETECTION JOB
-  # ===========================================================================
-  # Checks for configuration drift in both staging and production environments
-  # by comparing current infrastructure state with Terraform configuration.
-  # Runs in parallel for efficiency and generates detailed drift reports.
-  # ===========================================================================
-  drift-detection:
-    runs-on: self-hosted
-    needs: load-config
-    strategy:
-      matrix:
-        environment: [staging, production]  # Check both environments simultaneously
-    environment: ${{ matrix.environment }}  # Set environment context for proper secret access
+  build-matrix:
+    name: Build team/env matrix
+    needs: _config
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      has-pairs: ${{ steps.matrix.outputs.has-pairs }}
     steps:
       - uses: actions/checkout@v4
-      
-      # Setup Terraform with provider caching for performance
+      - id: matrix
+        run: |
+          set -euo pipefail
+          pairs=()
+          for team_dir in config/teams/workspace/*/; do
+            team=$(basename "$team_dir")
+            [[ "$team" == _* ]] && continue
+            env_dir="${team_dir}envs"
+            [[ -d "$env_dir" ]] || continue
+            for env_file in "$env_dir"/*.tfvars; do
+              [[ -e "$env_file" ]] || continue
+              env=$(basename "$env_file" .tfvars)
+              alias=$(jq -r ".env_to_subscription[\"$env\"] // empty" config/global/subscriptions.json)
+              [[ -n "$alias" ]] || { echo "::warning::No subscription alias for env '$env', skipping ${team}/${env}"; continue; }
+              pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${alias}\"}")
+            done
+          done
+
+          if [[ ${#pairs[@]} -eq 0 ]]; then
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "has-pairs=false"          >> "$GITHUB_OUTPUT"
+          else
+            joined=$(IFS=,; echo "${pairs[*]}")
+            echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
+            echo "has-pairs=true"                    >> "$GITHUB_OUTPUT"
+          fi
+
+  drift:
+    name: "Drift · ${{ matrix.team }} / ${{ matrix.environment }}"
+    needs: [_config, build-matrix]
+    if: needs.build-matrix.outputs.has-pairs == 'true'
+    runs-on: ${{ fromJson(needs._config.outputs.runners) }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
+    env:
+      AZURE_SUB_DEV_QA: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
+      AZURE_CLIENT_DEV_QA: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
+      AZURE_SUB_STAGING_PROD: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
+      AZURE_CLIENT_STAGING_PROD: ${{ secrets.AZURE_CLIENT_ID_STAGING_PROD }}
+      TF_SA_DEV_QA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_DEV_QA }}
+      TF_SA_STAGING_PROD: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
+      TF_RG_DEV_QA: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
+      TF_RG_STAGING_PROD: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve subscription credentials
+        id: sub
+        run: |
+          ALIAS="${{ matrix.subscription_alias }}"
+          if [[ "$ALIAS" == "dev-qa" ]]; then
+            echo "sub_id=$AZURE_SUB_DEV_QA"           >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_DEV_QA"     >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_DEV_QA"                   >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_DEV_QA"                   >> "$GITHUB_OUTPUT"
+          else
+            echo "sub_id=$AZURE_SUB_STAGING_PROD"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_STAGING_PROD" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+          fi
+          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/global/subscriptions.json)
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ steps.sub.outputs.sub_id }}
+          client-id: ${{ steps.sub.outputs.client_id }}
+
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
-          terraform_version: ${{ fromJson(needs.load-config.outputs.base-config).terraform.version }}
-          working_directory: terraform/environments/${{ matrix.environment }}
+          working_directory: terraform/databricks
           environment: ${{ matrix.environment }}
-          
-      # Authenticate with Azure using OIDC (environment-specific secrets)
-      - name: Azure Login
-        uses: ./.github/actions/azure-login
-        with:
-          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription_id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          client_id: ${{ secrets.AZURE_CLIENT_ID }}
-          
-      # Initialize Terraform with the appropriate backend for this environment
-      - name: Configure backend
-        working-directory: terraform/environments/${{ matrix.environment }}
+
+      - name: Terraform init
+        working-directory: terraform/databricks
+        env:
+          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
+          RESOURCE_GROUP: ${{ steps.sub.outputs.rg }}
+          CONTAINER: ${{ steps.sub.outputs.container }}
+          STATE_KEY: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
         run: |
-          # Select appropriate config based on current environment
-          ENV_CONFIG='${{ matrix.environment == 'staging' && needs.load-config.outputs.staging-config || needs.load-config.outputs.production-config }}'
-          BACKEND_CONFIG=$(echo $ENV_CONFIG | jq -r '.terraform.backend')
-          
-          # Initialize with environment-specific state backend
           terraform init \
-            -backend-config="storage_account_name=$(echo $BACKEND_CONFIG | jq -r '.storage_account_name')" \
-            -backend-config="container_name=$(echo $BACKEND_CONFIG | jq -r '.container_name')" \
-            -backend-config="resource_group_name=$(echo $BACKEND_CONFIG | jq -r '.resource_group_name')" \
-            -backend-config="key=$(echo $BACKEND_CONFIG | jq -r '.key')"
-            
-      # Run terraform plan with detailed exit codes to detect drift
+            -backend-config="storage_account_name=$STORAGE_ACCOUNT" \
+            -backend-config="container_name=$CONTAINER" \
+            -backend-config="resource_group_name=$RESOURCE_GROUP" \
+            -backend-config="key=$STATE_KEY"
+
       - name: Check for drift
-        id: drift
-        working-directory: terraform/environments/${{ matrix.environment }}
+        id: check
+        working-directory: terraform/databricks
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
         run: |
-          # Run terraform plan with detailed exit codes:
-          # 0 = no changes, 1 = error, 2 = changes detected (drift)
-          terraform plan -detailed-exitcode -out=drift-plan-${{ matrix.environment }} > drift-output-${{ matrix.environment }}.txt 2>&1
-          exit_code=$?
-          echo "exit_code=$exit_code" >> $GITHUB_OUTPUT
-          
-          # Interpret the exit code and set drift flag
-          if [ $exit_code -eq 2 ]; then
-            echo "has_drift=true" >> $GITHUB_OUTPUT
-            echo "Drift detected in ${{ matrix.environment }} environment"
+          set +e
+          terraform plan \
+            -var-file=../../config/teams/workspace/${{ matrix.team }}/common.tfvars \
+            -var-file=../../config/teams/workspace/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
+            -detailed-exitcode \
+            -out=drift.tfplan \
+            -input=false 2>&1 | tee drift.log
+          TF_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "exitcode=$TF_EXIT" >> "$GITHUB_OUTPUT"
+          if [[ $TF_EXIT -eq 0 ]]; then
+            echo "has_drift=false" >> "$GITHUB_OUTPUT"
+          elif [[ $TF_EXIT -eq 2 ]]; then
+            echo "has_drift=true"  >> "$GITHUB_OUTPUT"
           else
-            echo "has_drift=false" >> $GITHUB_OUTPUT
-            echo "No drift detected in ${{ matrix.environment }} environment"
+            echo "Terraform plan failed"
+            exit 1
           fi
-          
-      # Save drift analysis reports as artifacts for review
+
       - name: Upload drift report
-        if: steps.drift.outputs.has_drift == 'true'
+        if: steps.check.outputs.has_drift == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: drift-report-${{ matrix.environment }}
+          name: drift-report-${{ matrix.team }}-${{ matrix.environment }}
           path: |
-            terraform/environments/${{ matrix.environment }}/drift-output-${{ matrix.environment }}.txt
-            terraform/environments/${{ matrix.environment }}/drift-plan-${{ matrix.environment }}
+            terraform/databricks/drift.tfplan
+            terraform/databricks/drift.log
           retention-days: 30
-          
-      # Alert team via Teams when drift is detected (requires immediate attention)
-      - name: Notify drift detected
-        if: steps.drift.outputs.has_drift == 'true' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
+
+      - name: Notify drift
+        if: steps.check.outputs.has_drift == 'true'
         uses: ./.github/actions/teams-notification
         with:
-          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
+          webhook_url: ${{ secrets.TEAMS_WEBHOOK_URL }}
           status: warning
-          environment: ${{ matrix.environment }}
-          message: "Infrastructure drift detected! Please review the drift report artifact."
-          
-      # Send confirmation when no drift is found (good news!)
-      - name: Notify no drift
-        if: steps.drift.outputs.has_drift == 'false' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != '' && fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook != 'REPLACE_WITH_YOUR_TEAMS_WEBHOOK_URL'
-        uses: ./.github/actions/teams-notification
-        with:
-          webhook_url: ${{ fromJson(needs.load-config.outputs.base-config).notifications.teams_webhook }}
-          status: success
-          environment: ${{ matrix.environment }}
-          message: "No infrastructure drift detected." 
+          environment: "${{ matrix.team }} / ${{ matrix.environment }}"
+          message: "Drift detected. See artifact drift-report-${{ matrix.team }}-${{ matrix.environment }}."
