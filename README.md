@@ -32,13 +32,21 @@ A comprehensive set of GitHub Actions workflows and Terraform templates for Azur
 │       ├── azure-login/
 │       ├── teams-notification/
 │       └── terraform-cache/
-├── config/                        # Environment configurations
-│   ├── base.json                  # Shared configuration
-│   ├── staging.json               # Staging-specific config
-│   ├── production.json            # Production-specific config
-│   └── imports/                   # Import configuration files
-│       ├── staging-imports.json       # Bulk import config for staging
-│       └── production-imports.json    # Bulk import config for production
+├── config/                        # All configuration lives here
+│   ├── global/                    # Team-agnostic, env-agnostic platform config
+│   │   ├── base.json              # Shared configuration (TF versions, runners, webhook)
+│   │   └── subscriptions.json     # env → Azure subscription mapping
+│   ├── envs/                      # Per-environment global config
+│   │   ├── staging.json           # Staging-specific config
+│   │   └── production.json        # Production-specific config
+│   ├── imports/                   # Import configuration files
+│   │   ├── staging-imports.json       # Bulk import config for staging
+│   │   └── production-imports.json    # Bulk import config for production
+│   └── teams/                     # Per-team Terraform variables, grouped by resource type
+│       ├── workspace/             # Databricks workspace tfvars per team
+│       │   ├── _template/         # Reference template (ignored by workflows)
+│       │   └── <team-name>/       # Per-team folder with common.tfvars + envs/<env>.tfvars
+│       └── keyvault/              # (Placeholder for future keyvault tfvars)
 ├── terraform/
 │   ├── environments/              # Environment-specific deployments
 │   │   ├── staging/
@@ -86,13 +94,13 @@ AZURE_CLIENT_ID          # Your Azure Client ID for OIDC
 TEAMS_WEBHOOK_URL        # Your Microsoft Teams webhook URL (optional)
 ```
 
-**Note:** Teams notifications are optional. If no webhook URL is configured in `base.json`, notification steps will be skipped and workflows will run normally.
+**Note:** Teams notifications are optional. If no webhook URL is configured in `config/global/base.json`, notification steps will be skipped and workflows will run normally.
 
 #### Repository Configuration
 
 Fill in the configuration files in the `config/` directory:
 
-**config/base.json:**
+**config/global/base.json:**
 ```json
 {
   "terraform": {
@@ -115,7 +123,7 @@ Fill in the configuration files in the `config/` directory:
 
 **Teams Notifications:** Replace `teams_webhook` with your actual Teams webhook URL, or leave as placeholder to disable notifications.
 
-**config/staging.json & config/production.json:**
+**config/envs/staging.json & config/envs/production.json:**
 ```json
 {
   "terraform": {

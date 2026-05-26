@@ -85,20 +85,20 @@ jobs:
       - name: Load base config
         id: load-base
         run: |
-          CONFIG=$(cat config/base.json | jq -c .)
+          CONFIG=$(cat config/global/base.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
           
       # Load environment-specific state storage configurations
       - name: Load staging config
         id: load-staging
         run: |
-          CONFIG=$(cat config/staging.json | jq -c .)
+          CONFIG=$(cat config/envs/staging.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
           
       - name: Load production config
         id: load-production
         run: |
-          CONFIG=$(cat config/production.json | jq -c .)
+          CONFIG=$(cat config/envs/production.json | jq -c .)
           echo "config=$CONFIG" >> $GITHUB_OUTPUT
 
   # ===========================================================================

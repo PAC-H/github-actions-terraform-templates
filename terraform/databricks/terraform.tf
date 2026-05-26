@@ -9,7 +9,7 @@ terraform {
   }
 
   # All backend arguments are supplied via -backend-config flags at init time.
-  # Key convention: teams/{team_name}/{environment}.tfstate
+  # Key convention: workspace/{team_name}/{environment}.tfstate
   backend "azurerm" {}
 }
 

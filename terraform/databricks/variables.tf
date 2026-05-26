@@ -9,7 +9,7 @@ variable "subscription_id" {
 }
 
 variable "team_name" {
-  description = "Team slug — must match the folder name under teams/ (from common.tfvars)"
+  description = "Team slug — must match the folder name under config/teams/workspace/ (from common.tfvars)"
   type        = string
 
   validation {

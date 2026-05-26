@@ -26,7 +26,7 @@
     "labels": ["self-hosted", "linux", "x64"]
   },
   "_comments": {
-    "azure_credentials": "Azure authentication uses OIDC federated credentials (no client secrets). Required GitHub secrets: AZURE_TENANT_ID, AZURE_CLIENT_ID_DEV_QA, AZURE_SUBSCRIPTION_DEV_QA, AZURE_CLIENT_ID_STAGING_PROD, AZURE_SUBSCRIPTION_STAGING_PROD. See config/subscriptions.json for the full mapping.",
+    "azure_credentials": "Azure authentication uses OIDC federated credentials (no client secrets). Required GitHub secrets: AZURE_TENANT_ID, AZURE_CLIENT_ID_DEV_QA, AZURE_SUBSCRIPTION_DEV_QA, AZURE_CLIENT_ID_STAGING_PROD, AZURE_SUBSCRIPTION_STAGING_PROD. See config/global/subscriptions.json for the full mapping.",
     "teams_webhook": "Replace with your actual Teams channel webhook URL for notifications",
     "backup_storage": "Replace with your actual Azure storage account name for state backups",
     "terraform_cache": "Provider caching improves performance by avoiding repeated downloads"

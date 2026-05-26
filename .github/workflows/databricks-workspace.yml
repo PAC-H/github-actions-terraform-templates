@@ -6,18 +6,18 @@ on:
       - main
       - develop
     paths:
-      - "teams/**"
+      - "config/teams/workspace/**"
       - "terraform/modules/databricks-workspace/**"
       - "terraform/databricks/**"
   pull_request:
     paths:
-      - "teams/**"
+      - "config/teams/workspace/**"
       - "terraform/modules/databricks-workspace/**"
       - "terraform/databricks/**"
   workflow_dispatch:
     inputs:
       team:
-        description: "Team name (folder name under teams/) or 'all' to run all teams"
+        description: "Team name (folder name under config/teams/workspace/) or 'all' to run all teams"
         required: true
         default: "all"
       environment:
@@ -45,8 +45,8 @@ jobs:
       - name: Load base config
         id: load
         run: |
-          RUNNERS=$(jq -c '.runners.labels' config/base.json)
-          WEBHOOK=$(jq -r '.notifications.teams_webhook' config/base.json)
+          RUNNERS=$(jq -c '.runners.labels' config/global/base.json)
+          WEBHOOK=$(jq -r '.notifications.teams_webhook' config/global/base.json)
           echo "runners=$RUNNERS" >> "$GITHUB_OUTPUT"
           echo "teams_webhook=$WEBHOOK" >> "$GITHUB_OUTPUT"
 
@@ -78,13 +78,13 @@ jobs:
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             if [[ "$TEAM_INPUT" == "all" ]]; then
-              teams=$(ls teams/ | grep -v '^_')
+              teams=$(ls config/teams/workspace/ | grep -v '^_')
             else
               teams="$TEAM_INPUT"
             fi
 
             for team in $teams; do
-              env_dir="teams/${team}/envs"
+              env_dir="config/teams/workspace/${team}/envs"
               if [[ ! -d "$env_dir" ]]; then
                 echo "::warning::No envs/ directory found for team '$team', skipping"
                 continue
@@ -106,7 +106,7 @@ jobs:
                 if echo "$all_envs" | grep -qx "$env"; then
                   sub_alias=$(python3 -c "
           import json
-          with open('config/subscriptions.json') as f:
+          with open('config/global/subscriptions.json') as f:
               cfg = json.load(f)
           print(cfg['env_to_subscription'].get('$env', ''))
           ")
@@ -132,13 +132,13 @@ jobs:
 
             if [[ -n "$module_changed" ]]; then
               echo "Module files changed — queuing all teams"
-              changed_teams=$(ls teams/ | grep -v '^_')
+              changed_teams=$(ls config/teams/workspace/ | grep -v '^_')
             else
-              changed_teams=$(echo "$changed_files" | grep "^teams/" | sed 's|teams/||;s|/.*||' | grep -v '^_' | sort -u || true)
+              changed_teams=$(echo "$changed_files" | grep "^config/teams/workspace/" | sed 's|config/teams/workspace/||;s|/.*||' | grep -v '^_' | sort -u || true)
             fi
 
             for team in $changed_teams; do
-              env_dir="teams/${team}/envs"
+              env_dir="config/teams/workspace/${team}/envs"
               if [[ ! -d "$env_dir" ]]; then
                 continue
               fi
@@ -151,7 +151,7 @@ jobs:
               for env in $envs; do
                 sub_alias=$(python3 -c "
           import json
-          with open('config/subscriptions.json') as f:
+          with open('config/global/subscriptions.json') as f:
               cfg = json.load(f)
           print(cfg['env_to_subscription'].get('$env', ''))
           ")
@@ -204,7 +204,7 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
           set -euo pipefail
-          TEAM_DIR="teams/${TEAM}"
+          TEAM_DIR="config/teams/workspace/${TEAM}"
           COMMON="${TEAM_DIR}/common.tfvars"
           ENV_FILE="${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars"
 
@@ -233,7 +233,7 @@ jobs:
             echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
             echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
           fi
-          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/subscriptions.json)
+          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/global/subscriptions.json)
           echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
 
       - name: Azure login (OIDC)
@@ -255,7 +255,7 @@ jobs:
           STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
           RESOURCE_GROUP: ${{ steps.sub.outputs.rg }}
           CONTAINER: ${{ steps.sub.outputs.container }}
-          STATE_KEY: "teams/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
+          STATE_KEY: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
           ARM_USE_OIDC: "true"
           ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -285,8 +285,8 @@ jobs:
           # Disable pipefail around this command so exit code 2 is handled explicitly.
           set +e
           terraform plan \
-            -var-file=../../teams/${{ matrix.team }}/common.tfvars \
-            -var-file=../../teams/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
+            -var-file=../../config/teams/workspace/${{ matrix.team }}/common.tfvars \
+            -var-file=../../config/teams/workspace/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
             -out=tfplan \
             -detailed-exitcode \
             -input=false 2>&1 | tee plan.log
@@ -350,7 +350,7 @@ jobs:
             echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
             echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
           fi
-          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/subscriptions.json)
+          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/global/subscriptions.json)
           echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
 
       - name: Azure login (OIDC)
@@ -378,7 +378,7 @@ jobs:
           STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
           RESOURCE_GROUP: ${{ steps.sub.outputs.rg }}
           CONTAINER: ${{ steps.sub.outputs.container }}
-          STATE_KEY: "teams/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
+          STATE_KEY: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
           ARM_USE_OIDC: "true"
           ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -452,7 +452,7 @@ jobs:
             echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
             echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
           fi
-          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/subscriptions.json)
+          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/global/subscriptions.json)
           echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
 
       - name: Azure login (OIDC)
@@ -480,7 +480,7 @@ jobs:
           STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
           RESOURCE_GROUP: ${{ steps.sub.outputs.rg }}
           CONTAINER: ${{ steps.sub.outputs.container }}
-          STATE_KEY: "teams/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
+          STATE_KEY: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
           ARM_USE_OIDC: "true"
           ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
