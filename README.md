@@ -5,7 +5,7 @@ GitHub Actions workflows + Terraform templates for deploying Azure Databricks wo
 ## Features
 
 - **Azure OIDC authentication** — no client secrets
-- **Multi-team, multi-environment** layout: each team gets its own folder under `config/teams/workspace/` with per-env tfvars
+- **Multi-team, multi-environment** layout: each team gets its own folder under `config/teams/` with per-env tfvars
 - **Per-env approval gates** via GitHub Environments (`databricks-staging`, `databricks-prod`)
 - **Subscription routing** via `config/global/subscriptions.json` (`dev`+`qa` share one subscription, `staging`+`prod` share another)
 - **Drift detection** across every team × env, weekly
@@ -36,18 +36,17 @@ GitHub Actions workflows + Terraform templates for deploying Azure Databricks wo
 │   ├── global/
 │   │   ├── base.json                     # Terraform versions, runners, webhook, backup storage
 │   │   └── subscriptions.json            # env → subscription-alias mapping
-│   ├── teams/
-│   │   └── workspace/                    # Per-team Databricks workspace tfvars
-│   │       ├── _template/                # Scaffolding source (skipped by workflows)
-│   │       ├── example-team-2env/        # staging + prod
-│   │       ├── example-team-4env/        # dev + qa + staging + prod
-│   │       └── <team>/
-│   │           ├── common.tfvars         # team-wide vars
-│   │           └── envs/
-│   │               ├── dev.tfvars
-│   │               ├── qa.tfvars
-│   │               ├── staging.tfvars
-│   │               └── prod.tfvars
+│   ├── teams/                            # Per-team tfvars (workspace today; +keyvault etc. later)
+│   │   ├── _template/                    # Scaffolding source (skipped by workflows)
+│   │   ├── example-team-2env/            # staging + prod
+│   │   ├── example-team-4env/            # dev + qa + staging + prod
+│   │   └── <team>/
+│   │       ├── common.tfvars             # team-wide vars
+│   │       └── envs/
+│   │           ├── dev.tfvars
+│   │           ├── qa.tfvars
+│   │           ├── staging.tfvars
+│   │           └── prod.tfvars
 │   └── imports/
 │       └── _template/                    # Per-env import templates for new teams
 │           ├── dev-imports.json
@@ -59,7 +58,7 @@ GitHub Actions workflows + Terraform templates for deploying Azure Databricks wo
 │   └── modules/
 │       └── databricks-workspace/         # Reusable Databricks workspace module
 ├── scripts/
-│   └── new-team-workspace.sh             # Scaffold a new team (2 or 4 envs)
+│   └── new-team.sh                       # Scaffold a new team (2 or 4 envs)
 ├── CLAUDE.md
 └── README.md
 ```
@@ -103,32 +102,34 @@ Create environments named **`databricks-staging`** and **`databricks-prod`** (Se
 
 ```bash
 # 4-env layout (dev + qa + staging + prod) — default
-./scripts/new-team-workspace.sh my-team
+./scripts/new-team.sh my-team
 
 # 2-env layout (staging + prod only)
-./scripts/new-team-workspace.sh my-team 2
+./scripts/new-team.sh my-team 2
 ```
 
-Then edit `config/teams/workspace/my-team/common.tfvars` and `envs/*.tfvars` to replace every `REPLACE_WITH_*` placeholder (subnet IDs, cost center, etc.). Make sure the resource group and subnets named in the tfvars exist in Azure first.
+Then edit `config/teams/my-team/common.tfvars` and `envs/*.tfvars` to replace every `REPLACE_WITH_*` placeholder (subnet IDs, cost center, etc.). Make sure the resource group and subnets named in the tfvars exist in Azure first.
 
 ### 5. Deploy
 
-Push to `develop` or `main`. The `databricks-workspace.yml` pipeline:
+Open a PR against `develop` or `main` to run plan across the affected `{team, env}` matrix. Once merged, trigger apply manually via the workflow's `Run workflow` button.
 
-1. `detect-changes` — diffs the push/PR to identify which teams changed (module changes queue all teams).
+`databricks-workspace.yml` jobs:
+
+1. `detect-changes` — on PR, diffs against base to identify changed teams (module changes queue all teams); on dispatch, honours `team` / `environment` inputs (`all` to fan out).
 2. `plan` — runs per `{team, env}` matrix entry against `terraform/databricks/` with both var-files.
-3. `apply-lower` — auto-applies `dev`/`qa` on push to `develop` or `main`.
-4. `apply-upper` — applies `staging`/`prod` on push to `main` only, after approval through the `databricks-<env>` environment.
+3. `apply-lower` — applies `dev`/`qa`. Only fires on dispatch from `develop` or `main`.
+4. `apply-upper` — applies `staging`/`prod`. Only fires on dispatch from `main`, gated by the `databricks-<env>` GitHub Environment.
 
-You can also `workflow_dispatch` with `team` and `environment` inputs (use `all` to fan out).
+PRs never trigger apply — both apply jobs check `github.event_name != 'pull_request'`.
 
 ## Workflows reference
 
 ### Databricks Workspace (`databricks-workspace.yml`)
-Main deploy pipeline. Triggers on push to `develop`/`main`, PRs to either, and manual dispatch. Builds a `{team, environment, subscription_alias}` matrix and runs plan, then apply gated by branch + GitHub Environment.
+Main deploy pipeline. Triggers on PRs (plan only) and `workflow_dispatch` (plan + apply). No push trigger — apply is manual. Builds a `{team, environment, subscription_alias}` matrix and runs plan, then apply gated by branch + GitHub Environment.
 
 ### Drift Detection (`terraform-drift-detection.yml`)
-Weekly (Sundays 09:00 UTC) and on demand. Fans out across **every** `{team, env}` combo under `config/teams/workspace/`, runs `terraform plan -detailed-exitcode`, uploads drift reports and notifies Teams for any drift.
+Weekly (Sundays 09:00 UTC) and on demand. Fans out across **every** `{team, env}` combo under `config/teams/`, runs `terraform plan -detailed-exitcode`, uploads drift reports and notifies Teams for any drift.
 
 ### State Management (`terraform-state-management.yml`)
 Manual operations against a single `{team, environment}`:
@@ -210,8 +211,8 @@ Triggers on `workflow_dispatch` and on pushes to `develop`/`main` that touch `te
 
 ```bash
 # Scaffold a team
-./scripts/new-team-workspace.sh my-team       # 4 envs (default)
-./scripts/new-team-workspace.sh my-team 2     # 2 envs
+./scripts/new-team.sh my-team       # 4 envs (default)
+./scripts/new-team.sh my-team 2     # 2 envs
 
 # Format check
 terraform fmt -check -recursive ./terraform
@@ -223,16 +224,16 @@ terraform validate
 
 # Plan one team/env locally (assumes you've initted with a real backend)
 terraform plan \
-  -var-file=../../config/teams/workspace/<team>/common.tfvars \
-  -var-file=../../config/teams/workspace/<team>/envs/<env>.tfvars
+  -var-file=../../config/teams/<team>/common.tfvars \
+  -var-file=../../config/teams/<team>/envs/<env>.tfvars
 ```
 
 ## Key invariants
 
 - **`compliance_profile = "enhanced"` requires `sku = "premium"`** — enforced as a `precondition` on a `terraform_data` resource in `terraform/modules/databricks-workspace/main.tf` and rejected at apply by the provider. Enhanced compliance is one-way; downgrading requires recreating the workspace.
-- **`prevent_destroy = true`** on `azurerm_databricks_workspace.this`. Removing a team or env from `config/teams/workspace/` will not destroy the workspace — the resource must be removed from state (or the lifecycle rule flipped) explicitly.
+- **`prevent_destroy = true`** on `azurerm_databricks_workspace.this`. Removing a team or env from `config/teams/` will not destroy the workspace — the resource must be removed from state (or the lifecycle rule flipped) explicitly.
 - **Subnets are pre-existing.** `public_subnet_id` / `private_subnet_id` in env tfvars are full Azure resource IDs; the module parses VNet ID + subnet names out of them.
-- **`config/teams/workspace/_template/`** is the scaffolding source; the workflows skip any directory starting with `_`. Don't rename it.
+- **`config/teams/_template/`** is the scaffolding source; the workflows skip any directory starting with `_`. Don't rename it.
 
 ## Security
 

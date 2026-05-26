@@ -8,7 +8,7 @@ on:
     branches: [main, develop]
     paths:
       - 'terraform/**'
-      - 'config/teams/workspace/**'
+      - 'config/teams/**'
   workflow_dispatch:
     inputs:
       team:
@@ -60,7 +60,7 @@ jobs:
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             if [[ "$TEAM_INPUT" == "all" ]]; then
-              teams=$(ls config/teams/workspace/ | grep -v '^_')
+              teams=$(ls config/teams/ | grep -v '^_')
             else
               teams="$TEAM_INPUT"
             fi
@@ -69,14 +69,14 @@ jobs:
             base_sha="${{ github.event.pull_request.base.sha }}"
             changed=$(git diff --name-only "$base_sha" HEAD)
             if echo "$changed" | grep -qE "^terraform/(modules/databricks-workspace|databricks)/"; then
-              teams=$(ls config/teams/workspace/ | grep -v '^_')
+              teams=$(ls config/teams/ | grep -v '^_')
             else
-              teams=$(echo "$changed" | grep "^config/teams/workspace/" | sed 's|config/teams/workspace/||;s|/.*||' | grep -v '^_' | sort -u || true)
+              teams=$(echo "$changed" | grep "^config/teams/" | sed 's|config/teams/||;s|/.*||' | grep -v '^_' | sort -u || true)
             fi
           fi
 
           for team in $teams; do
-            env_dir="config/teams/workspace/${team}/envs"
+            env_dir="config/teams/${team}/envs"
             [[ -d "$env_dir" ]] || continue
             all_envs=$(ls "$env_dir" 2>/dev/null | grep '\.tfvars$' | sed 's/\.tfvars$//' | sort)
             if [[ "$EVENT_NAME" == "workflow_dispatch" && "$ENV_INPUT" != "all" ]]; then
@@ -147,7 +147,7 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
           # Pull resource_group_name out of the team's env tfvars
-          ENV_FILE="config/teams/workspace/${TEAM}/envs/${ENVIRONMENT}.tfvars"
+          ENV_FILE="config/teams/${TEAM}/envs/${ENVIRONMENT}.tfvars"
           RG=$(grep -E '^[[:space:]]*resource_group_name[[:space:]]*=' "$ENV_FILE" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/' || true)
           echo "name=$RG" >> "$GITHUB_OUTPUT"
 
@@ -192,8 +192,8 @@ jobs:
           TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
         run: |
           terraform plan \
-            -var-file=../../config/teams/workspace/${{ matrix.team }}/common.tfvars \
-            -var-file=../../config/teams/workspace/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
+            -var-file=../../config/teams/${{ matrix.team }}/common.tfvars \
+            -var-file=../../config/teams/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
             -out=compliance.tfplan \
             -input=false
           terraform show -json compliance.tfplan > compliance.tfplan.json

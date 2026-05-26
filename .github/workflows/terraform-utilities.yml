@@ -25,7 +25,7 @@ on:
           - import-bulk
           - import-dry-run
       team:
-        description: "Team name (folder under config/teams/workspace/). Required for everything except tfupdate."
+        description: "Team name (folder under config/teams/). Required for everything except tfupdate."
         required: false
       environment:
         description: 'Environment (dev|qa|staging|prod). Required for everything except tfupdate.'
@@ -152,7 +152,7 @@ jobs:
           [[ -n "$TEAM" ]]        || fail "team input is required"
           [[ -n "$ENVIRONMENT" ]] || fail "environment input is required"
 
-          TEAM_DIR="config/teams/workspace/${TEAM}"
+          TEAM_DIR="config/teams/${TEAM}"
           [[ -f "${TEAM_DIR}/common.tfvars"  ]]         || fail "missing ${TEAM_DIR}/common.tfvars"
           [[ -f "${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars" ]] || fail "missing ${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars"
 
@@ -261,8 +261,8 @@ jobs:
           DESTROY_FLAG=""
           [[ "${{ github.event.inputs.operation }}" == "target-destroy" ]] && DESTROY_FLAG="-destroy"
           terraform plan $DESTROY_FLAG ${{ steps.targets.outputs.flags }} \
-            -var-file=../../config/teams/workspace/${{ github.event.inputs.team }}/common.tfvars \
-            -var-file=../../config/teams/workspace/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
+            -var-file=../../config/teams/${{ github.event.inputs.team }}/common.tfvars \
+            -var-file=../../config/teams/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
             -out=target.tfplan -input=false
 
       - name: Target apply
@@ -334,8 +334,8 @@ jobs:
           TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
         run: |
           terraform import \
-            -var-file=../../config/teams/workspace/${{ github.event.inputs.team }}/common.tfvars \
-            -var-file=../../config/teams/workspace/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
+            -var-file=../../config/teams/${{ github.event.inputs.team }}/common.tfvars \
+            -var-file=../../config/teams/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
             "${{ github.event.inputs.import_resource_address }}" \
             "${{ github.event.inputs.import_resource_id }}"
 
@@ -360,8 +360,8 @@ jobs:
               echo "Skip (in state): $ADDR"; continue
             fi
             if terraform import \
-                 -var-file=../../config/teams/workspace/${{ github.event.inputs.team }}/common.tfvars \
-                 -var-file=../../config/teams/workspace/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
+                 -var-file=../../config/teams/${{ github.event.inputs.team }}/common.tfvars \
+                 -var-file=../../config/teams/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
                  "$ADDR" "$ID"; then
               ok=$((ok+1))
             else
@@ -383,8 +383,8 @@ jobs:
         run: |
           set +e
           terraform plan -detailed-exitcode \
-            -var-file=../../config/teams/workspace/${{ github.event.inputs.team }}/common.tfvars \
-            -var-file=../../config/teams/workspace/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
+            -var-file=../../config/teams/${{ github.event.inputs.team }}/common.tfvars \
+            -var-file=../../config/teams/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
             -out=post-import.tfplan -input=false
           rc=$?
           set -e

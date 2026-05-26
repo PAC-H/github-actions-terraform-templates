@@ -1,23 +1,15 @@
 name: Databricks Workspace
 
 on:
-  push:
-    branches:
-      - main
-      - develop
-    paths:
-      - "config/teams/workspace/**"
-      - "terraform/modules/databricks-workspace/**"
-      - "terraform/databricks/**"
   pull_request:
     paths:
-      - "config/teams/workspace/**"
+      - "config/teams/**"
       - "terraform/modules/databricks-workspace/**"
       - "terraform/databricks/**"
   workflow_dispatch:
     inputs:
       team:
-        description: "Team name (folder name under config/teams/workspace/) or 'all' to run all teams"
+        description: "Team name (folder name under config/teams/) or 'all' to run all teams"
         required: true
         default: "all"
       environment:
@@ -82,13 +74,13 @@ jobs:
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             if [[ "$TEAM_INPUT" == "all" ]]; then
-              teams=$(ls config/teams/workspace/ | grep -v '^_')
+              teams=$(ls config/teams/ | grep -v '^_')
             else
               teams="$TEAM_INPUT"
             fi
 
             for team in $teams; do
-              env_dir="config/teams/workspace/${team}/envs"
+              env_dir="config/teams/${team}/envs"
               if [[ ! -d "$env_dir" ]]; then
                 echo "::warning::No envs/ directory found for team '$team', skipping"
                 continue
@@ -136,13 +128,13 @@ jobs:
 
             if [[ -n "$module_changed" ]]; then
               echo "Module files changed — queuing all teams"
-              changed_teams=$(ls config/teams/workspace/ | grep -v '^_')
+              changed_teams=$(ls config/teams/ | grep -v '^_')
             else
-              changed_teams=$(echo "$changed_files" | grep "^config/teams/workspace/" | sed 's|config/teams/workspace/||;s|/.*||' | grep -v '^_' | sort -u || true)
+              changed_teams=$(echo "$changed_files" | grep "^config/teams/" | sed 's|config/teams/||;s|/.*||' | grep -v '^_' | sort -u || true)
             fi
 
             for team in $changed_teams; do
-              env_dir="config/teams/workspace/${team}/envs"
+              env_dir="config/teams/${team}/envs"
               if [[ ! -d "$env_dir" ]]; then
                 continue
               fi
@@ -240,7 +232,7 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
           set -euo pipefail
-          TEAM_DIR="config/teams/workspace/${TEAM}"
+          TEAM_DIR="config/teams/${TEAM}"
           COMMON="${TEAM_DIR}/common.tfvars"
           ENV_FILE="${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars"
 
@@ -321,8 +313,8 @@ jobs:
           # Disable pipefail around this command so exit code 2 is handled explicitly.
           set +e
           terraform plan \
-            -var-file=../../config/teams/workspace/${{ matrix.team }}/common.tfvars \
-            -var-file=../../config/teams/workspace/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
+            -var-file=../../config/teams/${{ matrix.team }}/common.tfvars \
+            -var-file=../../config/teams/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
             -out=tfplan \
             -detailed-exitcode \
             -input=false 2>&1 | tee plan.log

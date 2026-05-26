@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Usage: ./scripts/new-team-workspace.sh <team-name> [2|4]
+# Usage: ./scripts/new-team.sh <team-name> [2|4]
 #
-# Scaffolds a new team folder under config/teams/workspace/<team-name>/ with:
+# Scaffolds a new team folder under config/teams/<team-name>/ with:
 #   common.tfvars     — team-wide Terraform variables
 #   envs/<env>.tfvars — per-environment Terraform variables (one file per env)
 #
@@ -35,10 +35,10 @@ if [[ "$ENV_COUNT" != "2" && "$ENV_COUNT" != "4" ]]; then
   exit 1
 fi
 
-DEST_DIR="$REPO_ROOT/config/teams/workspace/$TEAM_NAME"
+DEST_DIR="$REPO_ROOT/config/teams/$TEAM_NAME"
 
 if [[ -d "$DEST_DIR" ]]; then
-  echo "Error: config/teams/workspace/$TEAM_NAME already exists. Edit the existing files directly."
+  echo "Error: config/teams/$TEAM_NAME already exists. Edit the existing files directly."
   exit 1
 fi
 
@@ -80,7 +80,7 @@ compliance_profile = "${profile}"
 TFVARS
 done
 
-echo "✓ Created config/teams/workspace/${TEAM_NAME}/ (${ENV_COUNT} environments)"
+echo "✓ Created config/teams/${TEAM_NAME}/ (${ENV_COUNT} environments)"
 echo "    common.tfvars"
 for env in "${ENV_LIST[@]}"; do
   echo "    envs/${env}.tfvars"

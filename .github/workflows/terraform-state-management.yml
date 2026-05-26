@@ -3,7 +3,7 @@ name: Terraform State Management
 # Manual state operations for the multi-team Databricks workspaces:
 #   unlock | list | show | remove | backup | restore
 # All ops target a single {team, environment} except `backup`, which on schedule
-# iterates every team × env under config/teams/workspace/.
+# iterates every team × env under config/teams/.
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ on:
           - backup
           - restore
       team:
-        description: "Team name (folder under config/teams/workspace/). Ignored for scheduled backup."
+        description: "Team name (folder under config/teams/). Ignored for scheduled backup."
         required: false
       environment:
         description: 'Environment (dev|qa|staging|prod)'
@@ -111,7 +111,7 @@ jobs:
               ;;
           esac
 
-          TEAM_DIR="config/teams/workspace/${TEAM}"
+          TEAM_DIR="config/teams/${TEAM}"
           ENV_FILE="${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars"
           [[ -f "${TEAM_DIR}/common.tfvars" ]] || fail "missing ${TEAM_DIR}/common.tfvars"
           [[ -f "$ENV_FILE" ]]                 || fail "missing $ENV_FILE"
@@ -318,7 +318,7 @@ jobs:
         run: |
           set -euo pipefail
           pairs=()
-          for team_dir in config/teams/workspace/*/; do
+          for team_dir in config/teams/*/; do
             team=$(basename "$team_dir")
             [[ "$team" == _* ]] && continue
             env_dir="${team_dir}envs"

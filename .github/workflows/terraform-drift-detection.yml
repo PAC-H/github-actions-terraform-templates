@@ -1,6 +1,6 @@
 name: Terraform Drift Detection
 
-# Detects drift across every team × environment under config/teams/workspace/
+# Detects drift across every team × environment under config/teams/
 # by running `terraform plan -detailed-exitcode` against the live backend.
 # Runs weekly + on demand. Non-destructive.
 
@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           pairs=()
-          for team_dir in config/teams/workspace/*/; do
+          for team_dir in config/teams/*/; do
             team=$(basename "$team_dir")
             [[ "$team" == _* ]] && continue
             env_dir="${team_dir}envs"
@@ -144,8 +144,8 @@ jobs:
         run: |
           set +e
           terraform plan \
-            -var-file=../../config/teams/workspace/${{ matrix.team }}/common.tfvars \
-            -var-file=../../config/teams/workspace/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
+            -var-file=../../config/teams/${{ matrix.team }}/common.tfvars \
+            -var-file=../../config/teams/${{ matrix.team }}/envs/${{ matrix.environment }}.tfvars \
             -detailed-exitcode \
             -out=drift.tfplan \
             -input=false 2>&1 | tee drift.log
