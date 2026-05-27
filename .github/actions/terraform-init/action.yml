@@ -1,0 +1,51 @@
+name: 'Terraform Init'
+description: >
+  terraform init against the azurerm backend using -backend-config flags,
+  with OIDC ARM_* env vars wired up. Centralizes the init block that was
+  inlined into every workflow.
+inputs:
+  working_directory:
+    description: 'Working directory containing the root module'
+    required: true
+  storage_account:
+    description: 'Azure storage account name for state'
+    required: true
+  container:
+    description: 'Blob container name for state'
+    required: true
+  resource_group:
+    description: 'Resource group of the state storage account'
+    required: true
+  state_key:
+    description: 'Blob key for the .tfstate file (e.g. workspace/<team>/<env>.tfstate)'
+    required: true
+  client_id:
+    description: 'Azure client ID (OIDC)'
+    required: true
+  tenant_id:
+    description: 'Azure tenant ID'
+    required: true
+  subscription_id:
+    description: 'Azure subscription ID'
+    required: true
+runs:
+  using: 'composite'
+  steps:
+    - name: terraform init
+      shell: bash
+      working-directory: ${{ inputs.working_directory }}
+      env:
+        STORAGE_ACCOUNT: ${{ inputs.storage_account }}
+        CONTAINER: ${{ inputs.container }}
+        RESOURCE_GROUP: ${{ inputs.resource_group }}
+        STATE_KEY: ${{ inputs.state_key }}
+        ARM_USE_OIDC: "true"
+        ARM_CLIENT_ID: ${{ inputs.client_id }}
+        ARM_TENANT_ID: ${{ inputs.tenant_id }}
+        ARM_SUBSCRIPTION_ID: ${{ inputs.subscription_id }}
+      run: |
+        terraform init \
+          -backend-config="storage_account_name=$STORAGE_ACCOUNT" \
+          -backend-config="container_name=$CONTAINER" \
+          -backend-config="resource_group_name=$RESOURCE_GROUP" \
+          -backend-config="key=$STATE_KEY"

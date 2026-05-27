@@ -21,7 +21,7 @@ GitHub Actions workflows + Terraform templates for deploying Azure Databricks wo
 .
 ├── .github/
 │   ├── workflows/
-│   │   ├── databricks-workspace.yml      # Main deploy pipeline (plan + apply)
+│   │   ├── terraform-databricks.yml      # Main deploy pipeline (plan + apply)
 │   │   ├── terraform-drift-detection.yml # Weekly drift check, all team × env
 │   │   ├── terraform-state-management.yml# Unlock/list/show/remove/backup/restore
 │   │   ├── terraform-compliance.yml      # tflint + checkov + Azure Policy
@@ -114,7 +114,7 @@ Then edit `config/teams/my-team/common.tfvars` and `envs/*.tfvars` to replace ev
 
 Open a PR against `develop` or `main` to run plan across the affected `{team, env}` matrix. Once merged, trigger apply manually via the workflow's `Run workflow` button.
 
-`databricks-workspace.yml` jobs:
+`terraform-databricks.yml` jobs:
 
 1. `detect-changes` — on PR, diffs against base to identify changed teams (module changes queue all teams); on dispatch, honours `team` / `environment` inputs (`all` to fan out).
 2. `plan` — runs per `{team, env}` matrix entry against `terraform/databricks/` with both var-files.
@@ -125,7 +125,7 @@ PRs never trigger apply — both apply jobs check `github.event_name != 'pull_re
 
 ## Workflows reference
 
-### Databricks Workspace (`databricks-workspace.yml`)
+### Terraform Databricks (`terraform-databricks.yml`)
 Main deploy pipeline. Triggers on PRs (plan only) and `workflow_dispatch` (plan + apply). No push trigger — apply is manual. Builds a `{team, environment, subscription_alias}` matrix and runs plan, then apply gated by branch + GitHub Environment.
 
 ### Drift Detection (`terraform-drift-detection.yml`)

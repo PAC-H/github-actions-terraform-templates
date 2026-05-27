@@ -73,36 +73,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
-    env:
-      AZURE_SUB_DEV_QA: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
-      AZURE_CLIENT_DEV_QA: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
-      AZURE_SUB_STAGING_PROD: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
-      AZURE_CLIENT_STAGING_PROD: ${{ secrets.AZURE_CLIENT_ID_STAGING_PROD }}
-      TF_SA_DEV_QA: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_DEV_QA }}
-      TF_SA_STAGING_PROD: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
-      TF_RG_DEV_QA: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
-      TF_RG_STAGING_PROD: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Resolve subscription credentials
         id: sub
-        run: |
-          ALIAS="${{ matrix.subscription_alias }}"
-          if [[ "$ALIAS" == "dev-qa" ]]; then
-            echo "sub_id=$AZURE_SUB_DEV_QA"           >> "$GITHUB_OUTPUT"
-            echo "client_id=$AZURE_CLIENT_DEV_QA"     >> "$GITHUB_OUTPUT"
-            echo "sa=$TF_SA_DEV_QA"                   >> "$GITHUB_OUTPUT"
-            echo "rg=$TF_RG_DEV_QA"                   >> "$GITHUB_OUTPUT"
-          else
-            echo "sub_id=$AZURE_SUB_STAGING_PROD"     >> "$GITHUB_OUTPUT"
-            echo "client_id=$AZURE_CLIENT_STAGING_PROD" >> "$GITHUB_OUTPUT"
-            echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
-            echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
-          fi
-          CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container" config/global/subscriptions.json)
-          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/resolve-subscription
+        with:
+          subscription_alias: ${{ matrix.subscription_alias }}
+          azure_sub_dev_qa: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
+          azure_client_dev_qa: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
+          azure_sub_staging_prod: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
+          azure_client_staging_prod: ${{ secrets.AZURE_CLIENT_ID_STAGING_PROD }}
+          tf_sa_dev_qa: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_DEV_QA }}
+          tf_sa_staging_prod: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
+          tf_rg_dev_qa: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
+          tf_rg_staging_prod: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
 
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -119,22 +106,16 @@ jobs:
           environment: ${{ matrix.environment }}
 
       - name: Terraform init
-        working-directory: terraform/databricks
-        env:
-          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
-          RESOURCE_GROUP: ${{ steps.sub.outputs.rg }}
-          CONTAINER: ${{ steps.sub.outputs.container }}
-          STATE_KEY: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
-          ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
-          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
-        run: |
-          terraform init \
-            -backend-config="storage_account_name=$STORAGE_ACCOUNT" \
-            -backend-config="container_name=$CONTAINER" \
-            -backend-config="resource_group_name=$RESOURCE_GROUP" \
-            -backend-config="key=$STATE_KEY"
+        uses: ./.github/actions/terraform-init
+        with:
+          working_directory: terraform/databricks
+          storage_account: ${{ steps.sub.outputs.sa }}
+          container: ${{ steps.sub.outputs.container }}
+          resource_group: ${{ steps.sub.outputs.rg }}
+          state_key: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
+          client_id: ${{ steps.sub.outputs.client_id }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription_id: ${{ steps.sub.outputs.sub_id }}
 
       - name: Check for drift
         id: check

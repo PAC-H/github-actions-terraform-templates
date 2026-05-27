@@ -1,0 +1,97 @@
+name: 'Resolve Subscription Credentials'
+description: >
+  Picks the right Azure subscription/client/state-backend values for a given
+  subscription_alias and looks up the state container from subscriptions.json.
+  Centralizes the if/else dispatch that every workflow used to inline.
+inputs:
+  subscription_alias:
+    description: "Subscription alias from subscriptions.json (e.g. 'dev-qa', 'staging-prod')."
+    required: true
+  subscriptions_file:
+    description: 'Path to subscriptions.json'
+    required: false
+    default: 'config/global/subscriptions.json'
+  azure_sub_dev_qa:
+    required: true
+    description: 'AZURE_SUBSCRIPTION_DEV_QA secret'
+  azure_client_dev_qa:
+    required: true
+    description: 'AZURE_CLIENT_ID_DEV_QA secret'
+  azure_sub_staging_prod:
+    required: true
+    description: 'AZURE_SUBSCRIPTION_STAGING_PROD secret'
+  azure_client_staging_prod:
+    required: true
+    description: 'AZURE_CLIENT_ID_STAGING_PROD secret'
+  tf_sa_dev_qa:
+    required: true
+    description: 'TF_STATE_STORAGE_ACCOUNT_DEV_QA secret'
+  tf_sa_staging_prod:
+    required: true
+    description: 'TF_STATE_STORAGE_ACCOUNT_STAGING_PROD secret'
+  tf_rg_dev_qa:
+    required: false
+    default: ''
+    description: 'TF_STATE_RESOURCE_GROUP_DEV_QA secret (omit for jobs that do not init terraform)'
+  tf_rg_staging_prod:
+    required: false
+    default: ''
+    description: 'TF_STATE_RESOURCE_GROUP_STAGING_PROD secret (omit for jobs that do not init terraform)'
+outputs:
+  sub_id:
+    description: 'Resolved Azure subscription ID'
+    value: ${{ steps.resolve.outputs.sub_id }}
+  client_id:
+    description: 'Resolved Azure client ID for OIDC'
+    value: ${{ steps.resolve.outputs.client_id }}
+  sa:
+    description: 'Resolved Terraform state storage account name'
+    value: ${{ steps.resolve.outputs.sa }}
+  rg:
+    description: 'Resolved Terraform state resource group name'
+    value: ${{ steps.resolve.outputs.rg }}
+  container:
+    description: 'State container name from subscriptions.json'
+    value: ${{ steps.resolve.outputs.container }}
+runs:
+  using: 'composite'
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        ALIAS: ${{ inputs.subscription_alias }}
+        SUBSCRIPTIONS_FILE: ${{ inputs.subscriptions_file }}
+        AZURE_SUB_DEV_QA: ${{ inputs.azure_sub_dev_qa }}
+        AZURE_CLIENT_DEV_QA: ${{ inputs.azure_client_dev_qa }}
+        AZURE_SUB_STAGING_PROD: ${{ inputs.azure_sub_staging_prod }}
+        AZURE_CLIENT_STAGING_PROD: ${{ inputs.azure_client_staging_prod }}
+        TF_SA_DEV_QA: ${{ inputs.tf_sa_dev_qa }}
+        TF_SA_STAGING_PROD: ${{ inputs.tf_sa_staging_prod }}
+        TF_RG_DEV_QA: ${{ inputs.tf_rg_dev_qa }}
+        TF_RG_STAGING_PROD: ${{ inputs.tf_rg_staging_prod }}
+      run: |
+        set -euo pipefail
+        case "$ALIAS" in
+          dev-qa)
+            echo "sub_id=$AZURE_SUB_DEV_QA"           >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_DEV_QA"     >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_DEV_QA"                   >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_DEV_QA"                   >> "$GITHUB_OUTPUT"
+            ;;
+          staging-prod)
+            echo "sub_id=$AZURE_SUB_STAGING_PROD"     >> "$GITHUB_OUTPUT"
+            echo "client_id=$AZURE_CLIENT_STAGING_PROD" >> "$GITHUB_OUTPUT"
+            echo "sa=$TF_SA_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+            echo "rg=$TF_RG_STAGING_PROD"             >> "$GITHUB_OUTPUT"
+            ;;
+          *)
+            echo "::error::Unknown subscription_alias '$ALIAS' — expected 'dev-qa' or 'staging-prod'"
+            exit 1
+            ;;
+        esac
+        CONTAINER=$(jq -r ".subscriptions[\"$ALIAS\"].state_container // empty" "$SUBSCRIPTIONS_FILE")
+        if [[ -z "$CONTAINER" ]]; then
+          echo "::error::No state_container for alias '$ALIAS' in $SUBSCRIPTIONS_FILE"
+          exit 1
+        fi
+        echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"

@@ -12,7 +12,7 @@ There is now a single deployment flow — the multi-team Databricks workspace pi
 
 ### Multi-team Databricks flow
 
-Driven by `.github/workflows/databricks-workspace.yml`. The root Terraform module is `terraform/databricks/` and the reusable module is `terraform/modules/databricks-workspace/`. Per-team configuration lives in `config/teams/<team>/`:
+Driven by `.github/workflows/terraform-databricks.yml`. The root Terraform module is `terraform/databricks/` and the reusable module is `terraform/modules/databricks-workspace/`. Per-team configuration lives in `config/teams/<team>/`:
 
 ```
 config/teams/<team>/
@@ -39,7 +39,7 @@ The set of environments for a team is **inferred from the filenames in `envs/`**
 
 ### Ops workflows (same team × env model)
 
-The following workflows all share the same `team` + `environment` model and the same `Resolve subscription credentials` shell pattern as `databricks-workspace.yml`. They target the same `terraform/databricks/` root and the same `workspace/<team>/<env>.tfstate` state keys:
+The following workflows all share the same `team` + `environment` model and the same `Resolve subscription credentials` shell pattern as `terraform-databricks.yml`. They target the same `terraform/databricks/` root and the same `workspace/<team>/<env>.tfstate` state keys:
 
 - `terraform-drift-detection.yml` — weekly + manual. Fans out across every `{team, env}` under `config/teams/`, runs `terraform plan -detailed-exitcode`, uploads drift artifacts, notifies Teams.
 - `terraform-state-management.yml` — `unlock | list | show | remove | backup | restore` on a single `{team, env}`. Scheduled cron does a backup over every `{team, env}`.
@@ -47,7 +47,7 @@ The following workflows all share the same `team` + `environment` model and the 
 - `terraform-utilities.yml` — `tfupdate` (single root, no per-env duplication), `dependency-graph`, `target-apply`/`target-destroy`, and `import-individual` / `import-bulk` / `import-dry-run`. Bulk-import files live under `config/imports/<team>/<env>-imports.json` (templates in `config/imports/_template/`).
 - `terraform-testing.yml` — static checks only: `terraform fmt -check`, `terraform validate` against the root and the module (with `-backend=false`), and `tflint`. No Azure resources created.
 
-The state-management, utilities, and compliance workflows gate `staging`/`prod` slices on the `databricks-<env>` GitHub Environment, matching `databricks-workspace.yml`.
+The state-management, utilities, and compliance workflows gate `staging`/`prod` slices on the `databricks-<env>` GitHub Environment, matching `terraform-databricks.yml`.
 
 ## Key invariants and gotchas
 
@@ -88,7 +88,7 @@ The full sequence the workflow expects:
 1. Run `./scripts/new-team.sh <slug>` (slug must match `^[a-z0-9][a-z0-9-]*[a-z0-9]$`).
 2. Fill in `REPLACE_WITH_*` placeholders — subnet IDs, cost center.
 3. Ensure the subnets and (typically) the resource group exist in Azure first.
-4. Open a PR — the pipeline runs plan on every team × env. Once merged, trigger apply manually via the `Databricks Workspace` workflow's `Run workflow` button (dispatch from `develop` for dev/qa, from `main` for staging/prod — the latter still gated by the `databricks-staging` / `databricks-prod` GitHub Environments).
+4. Open a PR — the pipeline runs plan on every team × env. Once merged, trigger apply manually via the `Terraform Databricks` workflow's `Run workflow` button (dispatch from `develop` for dev/qa, from `main` for staging/prod — the latter still gated by the `databricks-staging` / `databricks-prod` GitHub Environments).
 
 ## When adding a new environment to an existing team
 
