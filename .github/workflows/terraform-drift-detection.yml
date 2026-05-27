@@ -19,12 +19,15 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     outputs:
       runners: ${{ steps.load.outputs.runners }}
+      terraform_version: ${{ steps.load.outputs.terraform_version }}
     steps:
       - uses: actions/checkout@v4
       - id: load
         run: |
           RUNNERS=$(jq -c '.runners.labels' config/global/base.json)
-          echo "runners=$RUNNERS" >> "$GITHUB_OUTPUT"
+          TF_VERSION=$(jq -r '.terraform.version' config/global/base.json)
+          echo "runners=$RUNNERS"              >> "$GITHUB_OUTPUT"
+          echo "terraform_version=$TF_VERSION" >> "$GITHUB_OUTPUT"
 
   build-matrix:
     name: Build team/env matrix
@@ -111,6 +114,7 @@ jobs:
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
+          terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
           environment: ${{ matrix.environment }}
 
@@ -179,3 +183,12 @@ jobs:
           status: warning
           environment: "${{ matrix.team }} / ${{ matrix.environment }}"
           message: "Drift detected. See artifact drift-report-${{ matrix.team }}-${{ matrix.environment }}."
+
+      - name: Notify failure
+        if: failure()
+        uses: ./.github/actions/teams-notification
+        with:
+          webhook_url: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          status: failure
+          environment: "${{ matrix.team }} / ${{ matrix.environment }}"
+          message: "Drift detection job failed — investigate the workflow run logs."

@@ -31,16 +31,16 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     outputs:
       runners: ${{ steps.load.outputs.runners }}
-      teams_webhook: ${{ steps.load.outputs.teams_webhook }}
+      terraform_version: ${{ steps.load.outputs.terraform_version }}
     steps:
       - uses: actions/checkout@v4
       - name: Load base config
         id: load
         run: |
           RUNNERS=$(jq -c '.runners.labels' config/global/base.json)
-          WEBHOOK=$(jq -r '.notifications.teams_webhook' config/global/base.json)
+          TF_VERSION=$(jq -r '.terraform.version' config/global/base.json)
           echo "runners=$RUNNERS" >> "$GITHUB_OUTPUT"
-          echo "teams_webhook=$WEBHOOK" >> "$GITHUB_OUTPUT"
+          echo "terraform_version=$TF_VERSION" >> "$GITHUB_OUTPUT"
 
   # ─────────────────────────────────────────────────────────────────────────────
   # Detect which teams and environments need to be processed
@@ -59,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Build team/env matrix
         id: build-matrix
@@ -100,12 +100,11 @@ jobs:
 
               for env in $envs; do
                 if echo "$all_envs" | grep -qx "$env"; then
-                  sub_alias=$(python3 -c "
-          import json
-          with open('config/global/subscriptions.json') as f:
-              cfg = json.load(f)
-          print(cfg['env_to_subscription'].get('$env', ''))
-          ")
+                  sub_alias=$(jq -r ".env_to_subscription[\"$env\"] // empty" config/global/subscriptions.json)
+                  if [[ -z "$sub_alias" ]]; then
+                    echo "::warning::No subscription alias for env '$env', skipping ${team}/${env}"
+                    continue
+                  fi
                   pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${sub_alias}\"}")
                 else
                   echo "::warning::Team '$team' does not have environment '$env', skipping"
@@ -145,12 +144,11 @@ jobs:
               fi
 
               for env in $envs; do
-                sub_alias=$(python3 -c "
-          import json
-          with open('config/global/subscriptions.json') as f:
-              cfg = json.load(f)
-          print(cfg['env_to_subscription'].get('$env', ''))
-          ")
+                sub_alias=$(jq -r ".env_to_subscription[\"$env\"] // empty" config/global/subscriptions.json)
+                if [[ -z "$sub_alias" ]]; then
+                  echo "::warning::No subscription alias for env '$env', skipping ${team}/${env}"
+                  continue
+                fi
                 pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${sub_alias}\"}")
               done
             done
@@ -274,6 +272,7 @@ jobs:
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
+          terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
           environment: ${{ matrix.environment }}
 
@@ -324,7 +323,6 @@ jobs:
             echo "Terraform plan failed"
             exit 1
           fi
-          echo "exitcode=$TF_EXIT" >> "$GITHUB_OUTPUT"
 
       - name: Upload plan artifact
         uses: actions/upload-artifact@v4
@@ -390,6 +388,7 @@ jobs:
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
+          terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
           environment: ${{ matrix.environment }}
 
@@ -491,6 +490,7 @@ jobs:
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
+          terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
           environment: ${{ matrix.environment }}
 

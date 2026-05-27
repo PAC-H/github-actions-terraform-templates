@@ -24,12 +24,15 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     outputs:
       runners: ${{ steps.load.outputs.runners }}
+      terraform_version: ${{ steps.load.outputs.terraform_version }}
     steps:
       - uses: actions/checkout@v4
       - id: load
         run: |
           RUNNERS=$(jq -c '.runners.labels' config/global/base.json)
-          echo "runners=$RUNNERS" >> "$GITHUB_OUTPUT"
+          TF_VERSION=$(jq -r '.terraform.version' config/global/base.json)
+          echo "runners=$RUNNERS"              >> "$GITHUB_OUTPUT"
+          echo "terraform_version=$TF_VERSION" >> "$GITHUB_OUTPUT"
 
   static-checks:
     name: fmt + validate + tflint
@@ -41,6 +44,7 @@ jobs:
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
+          terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
           environment: dev
 

@@ -65,12 +65,15 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     outputs:
       runners: ${{ steps.load.outputs.runners }}
+      terraform_version: ${{ steps.load.outputs.terraform_version }}
     steps:
       - uses: actions/checkout@v4
       - id: load
         run: |
           RUNNERS=$(jq -c '.runners.labels' config/global/base.json)
-          echo "runners=$RUNNERS" >> "$GITHUB_OUTPUT"
+          TF_VERSION=$(jq -r '.terraform.version' config/global/base.json)
+          echo "runners=$RUNNERS"              >> "$GITHUB_OUTPUT"
+          echo "terraform_version=$TF_VERSION" >> "$GITHUB_OUTPUT"
 
   # ───────────────────────────────────────────────────────────────────────────
   # tfupdate — single root, no per-env duplication
@@ -103,7 +106,7 @@ jobs:
           fi
 
       - name: Open PR
-        if: steps.check.outputs.has_updates == 'true' && github.event_name == 'push'
+        if: steps.check.outputs.has_updates == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -202,6 +205,7 @@ jobs:
       - name: Setup Terraform
         uses: ./.github/actions/setup-terraform
         with:
+          terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
           environment: ${{ github.event.inputs.environment }}
 
@@ -288,7 +292,7 @@ jobs:
           TS=$(date +%Y%m%d-%H%M%S)
           BACKUP="pre-import-${{ github.event.inputs.team }}-${{ github.event.inputs.environment }}-${TS}.tfstate"
           terraform state pull > "$BACKUP"
-          echo "BACKUP_NAME=$BACKUP" >> "$GITHUB_ENV"
+          echo "Pre-import state backup written to $BACKUP (uploaded via artifact glob)"
 
       - name: Import dry-run
         if: github.event.inputs.operation == 'import-dry-run' || github.event.inputs.operation == 'import-bulk'
@@ -388,7 +392,18 @@ jobs:
             -out=post-import.tfplan -input=false
           rc=$?
           set -e
-          [[ $rc -eq 0 || $rc -eq 2 ]] || exit 1
+          case "$rc" in
+            0)
+              echo "Post-import plan clean — import fully captured the resource's existing config."
+              ;;
+            2)
+              echo "::warning::Post-import plan still shows changes. The import may not fully capture the resource's existing config — inspect post-import.tfplan in the run artifacts and reconcile your Terraform code before applying."
+              ;;
+            *)
+              echo "::error::Post-import plan failed (exit $rc)"
+              exit 1
+              ;;
+          esac
 
       # ── artifacts + notify ───────────────────────────────────────────────
       - name: Upload artifacts

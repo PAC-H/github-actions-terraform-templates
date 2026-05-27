@@ -53,6 +53,7 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     outputs:
       runners: ${{ steps.load.outputs.runners }}
+      terraform_version: ${{ steps.load.outputs.terraform_version }}
       backup_account: ${{ steps.load.outputs.backup_account }}
       backup_container: ${{ steps.load.outputs.backup_container }}
     steps:
@@ -60,10 +61,12 @@ jobs:
       - id: load
         run: |
           RUNNERS=$(jq -c '.runners.labels' config/global/base.json)
+          TF_VERSION=$(jq -r '.terraform.version' config/global/base.json)
           BACKUP_ACCOUNT=$(jq -r '.storage.backup_account' config/global/base.json)
           BACKUP_CONTAINER=$(jq -r '.storage.backup_container' config/global/base.json)
-          echo "runners=$RUNNERS"               >> "$GITHUB_OUTPUT"
-          echo "backup_account=$BACKUP_ACCOUNT" >> "$GITHUB_OUTPUT"
+          echo "runners=$RUNNERS"                   >> "$GITHUB_OUTPUT"
+          echo "terraform_version=$TF_VERSION"      >> "$GITHUB_OUTPUT"
+          echo "backup_account=$BACKUP_ACCOUNT"     >> "$GITHUB_OUTPUT"
           echo "backup_container=$BACKUP_CONTAINER" >> "$GITHUB_OUTPUT"
 
   # ───────────────────────────────────────────────────────────────────────────
@@ -148,6 +151,7 @@ jobs:
         if: github.event.inputs.operation != 'restore'
         uses: ./.github/actions/setup-terraform
         with:
+          terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
           environment: ${{ github.event.inputs.environment }}
 
@@ -262,6 +266,26 @@ jobs:
         run: |
           set -euo pipefail
           KEY="workspace/${{ github.event.inputs.team }}/${{ github.event.inputs.environment }}.tfstate"
+          TS=$(date +%Y%m%d-%H%M%S)
+          PRE_RESTORE="${{ github.event.inputs.team }}-${{ github.event.inputs.environment }}-pre-restore-${TS}.tfstate"
+
+          # Safety backup: snapshot current state to the backup container before overwriting it.
+          echo "Snapshotting current state to ${BACKUP_CONTAINER}/${PRE_RESTORE}"
+          if az storage blob download \
+               --auth-mode login \
+               --account-name "$STORAGE_ACCOUNT" \
+               --container-name "$CONTAINER" \
+               --name "$KEY" \
+               --file "$PRE_RESTORE"; then
+            az storage blob upload \
+              --auth-mode login \
+              --account-name "$BACKUP_ACCOUNT" \
+              --container-name "$BACKUP_CONTAINER" \
+              --name "$PRE_RESTORE" \
+              --file "$PRE_RESTORE"
+          else
+            echo "::warning::No existing state at $KEY — nothing to back up before restore."
+          fi
 
           az storage blob download \
             --auth-mode login \

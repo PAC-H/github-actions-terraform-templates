@@ -19,58 +19,67 @@ runs:
   steps:
     - name: Send Teams notification
       shell: bash
+      env:
+        WEBHOOK_URL: ${{ inputs.webhook_url }}
+        STATUS: ${{ inputs.status }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        MESSAGE: ${{ inputs.message }}
+        REPOSITORY: ${{ github.repository }}
+        REF_NAME: ${{ github.ref_name }}
+        SHA: ${{ github.sha }}
+        ACTOR: ${{ github.actor }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: |
-        STATUS_COLOR=""
-        STATUS_ICON=""
-        case "${{ inputs.status }}" in
-          "success")
-            STATUS_COLOR="28a745"
-            STATUS_ICON="✅"
-            ;;
-          "failure")
-            STATUS_COLOR="dc3545"
-            STATUS_ICON="❌"
-            ;;
-          "warning")
-            STATUS_COLOR="ffc107"
-            STATUS_ICON="⚠️"
-            ;;
+        set -euo pipefail
+
+        case "$STATUS" in
+          success) COLOR="28a745"; ICON="✅" ;;
+          failure) COLOR="dc3545"; ICON="❌" ;;
+          warning) COLOR="ffc107"; ICON="⚠️" ;;
+          *)       COLOR="cccccc"; ICON="•"  ;;
         esac
-        
-        PAYLOAD=$(cat <<EOF
-        {
-          "@type": "MessageCard",
-          "@context": "http://schema.org/extensions",
-          "themeColor": "$STATUS_COLOR",
-          "summary": "Terraform Pipeline - ${{ inputs.environment }}",
-          "sections": [{
-            "activityTitle": "$STATUS_ICON Terraform Pipeline - ${{ inputs.environment }}",
-            "activitySubtitle": "Status: ${{ inputs.status }}",
-            "facts": [{
-              "name": "Repository:",
-              "value": "${{ github.repository }}"
-            }, {
-              "name": "Branch:",
-              "value": "${{ github.ref_name }}"
-            }, {
-              "name": "Commit:",
-              "value": "${{ github.sha }}"
-            }, {
-              "name": "Actor:",
-              "value": "${{ github.actor }}"
-            }],
-            "text": "${{ inputs.message }}"
-          }],
-          "potentialAction": [{
-            "@type": "OpenUri",
-            "name": "View Run",
-            "targets": [{
-              "os": "default",
-              "uri": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            }]
-          }]
-        }
-        EOF
-        )
-        
-        curl -H "Content-Type: application/json" -d "$PAYLOAD" "${{ inputs.webhook_url }}" 
+
+        PAYLOAD=$(jq -n \
+          --arg color   "$COLOR" \
+          --arg icon    "$ICON" \
+          --arg status  "$STATUS" \
+          --arg env     "$ENVIRONMENT" \
+          --arg repo    "$REPOSITORY" \
+          --arg ref     "$REF_NAME" \
+          --arg sha     "$SHA" \
+          --arg actor   "$ACTOR" \
+          --arg msg     "$MESSAGE" \
+          --arg run_uri "$RUN_URL" \
+          '{
+             "@type":    "MessageCard",
+             "@context": "http://schema.org/extensions",
+             themeColor: $color,
+             summary:    ("Terraform Pipeline - " + $env),
+             sections: [{
+               activityTitle:    ($icon + " Terraform Pipeline - " + $env),
+               activitySubtitle: ("Status: " + $status),
+               facts: [
+                 {name: "Repository:", value: $repo},
+                 {name: "Branch:",     value: $ref},
+                 {name: "Commit:",     value: $sha},
+                 {name: "Actor:",      value: $actor}
+               ],
+               text: $msg
+             }],
+             potentialAction: [{
+               "@type":  "OpenUri",
+               name:     "View Run",
+               targets: [{os: "default", uri: $run_uri}]
+             }]
+           }')
+
+        HTTP_CODE=$(curl -sS -o /tmp/teams-response.txt -w "%{http_code}" \
+          -H "Content-Type: application/json" \
+          -d "$PAYLOAD" \
+          "$WEBHOOK_URL")
+
+        if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
+          echo "::error::Teams webhook returned HTTP $HTTP_CODE"
+          cat /tmp/teams-response.txt || true
+          exit 1
+        fi
