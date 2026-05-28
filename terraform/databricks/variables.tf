@@ -22,6 +22,10 @@ variable "environment" {
   description = "Environment name: dev, qa, staging, or prod (from envs/<env>.tfvars)"
   type        = string
 
+  # Keep this list in sync with the keys under .environments in
+  # config/global/subscriptions.json — that file is the source of truth for
+  # tier metadata (subscription + requires_approval), but Terraform can't read
+  # JSON at validation time, so the allowed set is duplicated here.
   validation {
     condition     = contains(["dev", "qa", "staging", "prod"], var.environment)
     error_message = "environment must be one of: dev, qa, staging, prod."

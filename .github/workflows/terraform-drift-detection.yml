@@ -50,7 +50,7 @@ jobs:
             for env_file in "$env_dir"/*.tfvars; do
               [[ -e "$env_file" ]] || continue
               env=$(basename "$env_file" .tfvars)
-              alias=$(jq -r ".env_to_subscription[\"$env\"] // empty" config/global/subscriptions.json)
+              alias=$(jq -r ".environments[\"$env\"].subscription // empty" config/global/subscriptions.json)
               [[ -n "$alias" ]] || { echo "::warning::No subscription alias for env '$env', skipping ${team}/${env}"; continue; }
               pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${alias}\"}")
             done

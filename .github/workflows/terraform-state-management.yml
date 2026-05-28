@@ -56,6 +56,7 @@ jobs:
       terraform_version: ${{ steps.load.outputs.terraform_version }}
       backup_account: ${{ steps.load.outputs.backup_account }}
       backup_container: ${{ steps.load.outputs.backup_container }}
+      approval_envs: ${{ steps.load.outputs.approval_envs }}
     steps:
       - uses: actions/checkout@v4
       - id: load
@@ -64,10 +65,12 @@ jobs:
           TF_VERSION=$(jq -r '.terraform.version' config/global/base.json)
           BACKUP_ACCOUNT=$(jq -r '.storage.backup_account' config/global/base.json)
           BACKUP_CONTAINER=$(jq -r '.storage.backup_container' config/global/base.json)
+          APPROVAL_ENVS=$(jq -c '[.environments | to_entries[] | select(.value.requires_approval) | .key]' config/global/subscriptions.json)
           echo "runners=$RUNNERS"                   >> "$GITHUB_OUTPUT"
           echo "terraform_version=$TF_VERSION"      >> "$GITHUB_OUTPUT"
           echo "backup_account=$BACKUP_ACCOUNT"     >> "$GITHUB_OUTPUT"
           echo "backup_container=$BACKUP_CONTAINER" >> "$GITHUB_OUTPUT"
+          echo "approval_envs=$APPROVAL_ENVS"       >> "$GITHUB_OUTPUT"
 
   # ───────────────────────────────────────────────────────────────────────────
   # Single-slice operations: unlock | list | show | remove | restore + manual backup
@@ -77,7 +80,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch'
     needs: _config
     runs-on: ${{ fromJson(needs._config.outputs.runners) }}
-    environment: ${{ (github.event.inputs.environment == 'staging' || github.event.inputs.environment == 'prod') && format('databricks-{0}', github.event.inputs.environment) || '' }}
+    environment: ${{ contains(fromJson(needs._config.outputs.approval_envs), github.event.inputs.environment) && format('databricks-{0}', github.event.inputs.environment) || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -116,7 +119,7 @@ jobs:
           ENVIRONMENT: ${{ github.event.inputs.environment }}
         run: |
           set -euo pipefail
-          a=$(jq -r ".env_to_subscription[\"$ENVIRONMENT\"] // empty" config/global/subscriptions.json)
+          a=$(jq -r ".environments[\"$ENVIRONMENT\"].subscription // empty" config/global/subscriptions.json)
           [[ -n "$a" ]] || { echo "::error::No subscription alias for env '$ENVIRONMENT'"; exit 1; }
           echo "alias=$a" >> "$GITHUB_OUTPUT"
 
@@ -338,7 +341,7 @@ jobs:
             for env_file in "$env_dir"/*.tfvars; do
               [[ -e "$env_file" ]] || continue
               env=$(basename "$env_file" .tfvars)
-              alias=$(jq -r ".env_to_subscription[\"$env\"] // empty" config/global/subscriptions.json)
+              alias=$(jq -r ".environments[\"$env\"].subscription // empty" config/global/subscriptions.json)
               [[ -n "$alias" ]] || continue
               pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${alias}\"}")
             done

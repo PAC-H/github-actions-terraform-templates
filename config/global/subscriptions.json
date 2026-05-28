@@ -1,9 +1,9 @@
 {
-  "env_to_subscription": {
-    "dev": "dev-qa",
-    "qa": "dev-qa",
-    "staging": "staging-prod",
-    "prod": "staging-prod"
+  "environments": {
+    "dev":     { "subscription": "dev-qa",       "requires_approval": false },
+    "qa":      { "subscription": "dev-qa",       "requires_approval": false },
+    "staging": { "subscription": "staging-prod", "requires_approval": true  },
+    "prod":    { "subscription": "staging-prod", "requires_approval": true  }
   },
   "subscriptions": {
     "dev-qa": {

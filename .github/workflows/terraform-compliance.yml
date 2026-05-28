@@ -105,7 +105,7 @@ jobs:
             fi
             for env in $envs; do
               echo "$all_envs" | grep -qx "$env" || continue
-              alias=$(jq -r ".env_to_subscription[\"$env\"] // empty" config/global/subscriptions.json)
+              alias=$(jq -r ".environments[\"$env\"].subscription // empty" config/global/subscriptions.json)
               [[ -n "$alias" ]] || continue
               pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${alias}\"}")
             done

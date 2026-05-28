@@ -66,14 +66,17 @@ jobs:
     outputs:
       runners: ${{ steps.load.outputs.runners }}
       terraform_version: ${{ steps.load.outputs.terraform_version }}
+      approval_envs: ${{ steps.load.outputs.approval_envs }}
     steps:
       - uses: actions/checkout@v4
       - id: load
         run: |
           RUNNERS=$(jq -c '.runners.labels' config/global/base.json)
           TF_VERSION=$(jq -r '.terraform.version' config/global/base.json)
+          APPROVAL_ENVS=$(jq -c '[.environments | to_entries[] | select(.value.requires_approval) | .key]' config/global/subscriptions.json)
           echo "runners=$RUNNERS"              >> "$GITHUB_OUTPUT"
           echo "terraform_version=$TF_VERSION" >> "$GITHUB_OUTPUT"
+          echo "approval_envs=$APPROVAL_ENVS"  >> "$GITHUB_OUTPUT"
 
   # ───────────────────────────────────────────────────────────────────────────
   # tfupdate — single root, no per-env duplication
@@ -130,7 +133,7 @@ jobs:
       github.event.inputs.operation == 'import-dry-run'
     needs: _config
     runs-on: ${{ fromJson(needs._config.outputs.runners) }}
-    environment: ${{ (github.event.inputs.environment == 'staging' || github.event.inputs.environment == 'prod') && format('databricks-{0}', github.event.inputs.environment) || '' }}
+    environment: ${{ contains(fromJson(needs._config.outputs.approval_envs), github.event.inputs.environment) && format('databricks-{0}', github.event.inputs.environment) || '' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -172,7 +175,7 @@ jobs:
           ENVIRONMENT: ${{ github.event.inputs.environment }}
         run: |
           set -euo pipefail
-          a=$(jq -r ".env_to_subscription[\"$ENVIRONMENT\"] // empty" config/global/subscriptions.json)
+          a=$(jq -r ".environments[\"$ENVIRONMENT\"].subscription // empty" config/global/subscriptions.json)
           [[ -n "$a" ]] || { echo "::error::No subscription alias for env '$ENVIRONMENT'"; exit 1; }
           echo "alias=$a" >> "$GITHUB_OUTPUT"
 
