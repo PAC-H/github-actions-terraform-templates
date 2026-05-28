@@ -1,0 +1,218 @@
+name: 'Build Team x Env Matrix'
+description: >
+  Builds a {team, environment, subscription_alias} matrix for downstream
+  jobs. Three modes:
+    - 'all'      iterates every team x env under config/teams/
+    - 'dispatch' uses team_input / env_input (each accepts 'all')
+    - 'changed'  uses git diff against base_sha; if any changed file matches
+                 module_change_paths, queues every team
+    - 'auto'     (default) picks dispatch on workflow_dispatch, changed on
+                 pull_request/push, all otherwise
+
+  Optionally splits the matrix by requires_approval (from
+  config/global/subscriptions.json) into matrix-lower / matrix-upper.
+
+inputs:
+  mode:
+    description: "'all' | 'dispatch' | 'changed' | 'auto'"
+    required: false
+    default: 'auto'
+  team_input:
+    description: "For dispatch mode: team name or 'all'"
+    required: false
+    default: ''
+  env_input:
+    description: "For dispatch mode: environment name or 'all'"
+    required: false
+    default: ''
+  base_sha:
+    description: "For changed mode: git base SHA to diff against. Defaults to the PR base SHA on pull_request, HEAD~1 otherwise."
+    required: false
+    default: ''
+  module_change_paths:
+    description: "For changed mode: grep -E regex of paths whose changes should queue every team."
+    required: false
+    default: '^terraform/(modules/databricks-workspace|databricks)/'
+  split_by_approval:
+    description: "If 'true', also emit matrix-lower (requires_approval=false) and matrix-upper (requires_approval=true), and include requires_approval in each pair."
+    required: false
+    default: 'false'
+
+outputs:
+  matrix:
+    description: "Full matrix as {\"include\":[...]}"
+    value: ${{ steps.build.outputs.matrix }}
+  has-pairs:
+    description: "'true' if matrix is non-empty"
+    value: ${{ steps.build.outputs.has-pairs }}
+  matrix-lower:
+    description: "Pairs whose env has requires_approval=false (only emitted when split_by_approval=true)"
+    value: ${{ steps.build.outputs.matrix-lower }}
+  matrix-upper:
+    description: "Pairs whose env has requires_approval=true (only emitted when split_by_approval=true)"
+    value: ${{ steps.build.outputs.matrix-upper }}
+  has-lower:
+    description: "'true' if matrix-lower is non-empty"
+    value: ${{ steps.build.outputs.has-lower }}
+  has-upper:
+    description: "'true' if matrix-upper is non-empty"
+    value: ${{ steps.build.outputs.has-upper }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: build
+      shell: bash
+      env:
+        MODE_INPUT: ${{ inputs.mode }}
+        TEAM_INPUT: ${{ inputs.team_input }}
+        ENV_INPUT: ${{ inputs.env_input }}
+        BASE_SHA_INPUT: ${{ inputs.base_sha }}
+        MODULE_CHANGE_PATHS: ${{ inputs.module_change_paths }}
+        SPLIT_BY_APPROVAL: ${{ inputs.split_by_approval }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+
+        SUBS_FILE="config/global/subscriptions.json"
+
+        # ── helpers ────────────────────────────────────────────────────────
+        list_all_teams() {
+          for d in config/teams/*/; do
+            n=$(basename "$d")
+            [[ "$n" == _* ]] && continue
+            echo "$n"
+          done
+        }
+        list_envs_for_team() {
+          local team="$1"
+          for f in "config/teams/${team}/envs"/*.tfvars; do
+            [[ -e "$f" ]] || continue
+            basename "$f" .tfvars
+          done | sort
+        }
+        # Emit one pair JSON object. Includes requires_approval only when split is requested.
+        emit_pair() {
+          local team="$1" env="$2"
+          local env_meta sub_alias requires_approval
+          env_meta=$(jq -c ".environments[\"$env\"] // empty" "$SUBS_FILE")
+          if [[ -z "$env_meta" ]]; then
+            echo "::warning::No subscriptions.json entry for env '$env', skipping ${team}/${env}" >&2
+            return 1
+          fi
+          sub_alias=$(jq -r '.subscription' <<<"$env_meta")
+          if [[ "$SPLIT_BY_APPROVAL" == "true" ]]; then
+            requires_approval=$(jq -r '.requires_approval' <<<"$env_meta")
+            printf '{"team":"%s","environment":"%s","subscription_alias":"%s","requires_approval":%s}' \
+              "$team" "$env" "$sub_alias" "$requires_approval"
+          else
+            printf '{"team":"%s","environment":"%s","subscription_alias":"%s"}' \
+              "$team" "$env" "$sub_alias"
+          fi
+        }
+
+        # ── resolve mode ───────────────────────────────────────────────────
+        MODE="$MODE_INPUT"
+        if [[ "$MODE" == "auto" ]]; then
+          case "$EVENT_NAME" in
+            workflow_dispatch) MODE="dispatch" ;;
+            pull_request|push) MODE="changed" ;;
+            *)                 MODE="all" ;;
+          esac
+        fi
+        echo "Matrix builder mode: $MODE"
+
+        # ── collect teams ──────────────────────────────────────────────────
+        teams=""
+        case "$MODE" in
+          all)
+            teams=$(list_all_teams)
+            ;;
+          dispatch)
+            if [[ -z "$TEAM_INPUT" || "$TEAM_INPUT" == "all" ]]; then
+              teams=$(list_all_teams)
+            else
+              teams="$TEAM_INPUT"
+            fi
+            ;;
+          changed)
+            base_sha="$BASE_SHA_INPUT"
+            if [[ -z "$base_sha" ]]; then
+              if [[ "$EVENT_NAME" == "pull_request" && -n "$PR_BASE_SHA" ]]; then
+                base_sha="$PR_BASE_SHA"
+              else
+                base_sha="HEAD~1"
+              fi
+            fi
+            changed_files=$(git diff --name-only "$base_sha" HEAD)
+            echo "Changed files since $base_sha:"
+            echo "$changed_files"
+            if echo "$changed_files" | grep -qE "$MODULE_CHANGE_PATHS"; then
+              echo "Module path change detected — queuing all teams"
+              teams=$(list_all_teams)
+            else
+              teams=$(echo "$changed_files" | grep "^config/teams/" \
+                | sed 's|config/teams/||;s|/.*||' | grep -v '^_' | sort -u || true)
+            fi
+            ;;
+          *)
+            echo "::error::Unknown mode '$MODE' (expected all|dispatch|changed|auto)"
+            exit 1
+            ;;
+        esac
+
+        # ── build pairs ────────────────────────────────────────────────────
+        pairs=()
+        for team in $teams; do
+          env_dir="config/teams/${team}/envs"
+          [[ -d "$env_dir" ]] || { echo "::warning::No envs/ dir for team '$team', skipping"; continue; }
+          all_envs=$(list_envs_for_team "$team")
+          [[ -n "$all_envs" ]] || { echo "::warning::No envs/*.tfvars for team '$team', skipping"; continue; }
+
+          # Determine the env list for this team in this mode.
+          if [[ "$MODE" == "dispatch" && -n "$ENV_INPUT" && "$ENV_INPUT" != "all" ]]; then
+            envs="$ENV_INPUT"
+          else
+            envs="$all_envs"
+          fi
+
+          for env in $envs; do
+            # Restrict to envs the team actually has.
+            echo "$all_envs" | grep -qx "$env" || {
+              [[ "$MODE" == "dispatch" ]] && echo "::warning::Team '$team' does not have environment '$env', skipping"
+              continue
+            }
+            if pair=$(emit_pair "$team" "$env"); then
+              pairs+=("$pair")
+            fi
+          done
+        done
+
+        # ── emit outputs ───────────────────────────────────────────────────
+        if [[ ${#pairs[@]} -eq 0 ]]; then
+          echo "No team/env pairs matched"
+          echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+          echo 'has-pairs=false'        >> "$GITHUB_OUTPUT"
+          if [[ "$SPLIT_BY_APPROVAL" == "true" ]]; then
+            echo 'matrix-lower={"include":[]}' >> "$GITHUB_OUTPUT"
+            echo 'matrix-upper={"include":[]}' >> "$GITHUB_OUTPUT"
+            echo 'has-lower=false'              >> "$GITHUB_OUTPUT"
+            echo 'has-upper=false'              >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+        fi
+
+        all_json=$(printf '%s\n' "${pairs[@]}" | jq -cs '.')
+        echo "matrix={\"include\":${all_json}}" >> "$GITHUB_OUTPUT"
+        echo 'has-pairs=true'                    >> "$GITHUB_OUTPUT"
+        echo "Matrix: {\"include\":${all_json}}"
+
+        if [[ "$SPLIT_BY_APPROVAL" == "true" ]]; then
+          lower_json=$(jq -c 'map(select(.requires_approval == false))' <<<"$all_json")
+          upper_json=$(jq -c 'map(select(.requires_approval == true))'  <<<"$all_json")
+          echo "matrix-lower={\"include\":${lower_json}}" >> "$GITHUB_OUTPUT"
+          echo "matrix-upper={\"include\":${upper_json}}" >> "$GITHUB_OUTPUT"
+          [[ "$lower_json" == "[]" ]] && echo "has-lower=false" >> "$GITHUB_OUTPUT" || echo "has-lower=true" >> "$GITHUB_OUTPUT"
+          [[ "$upper_json" == "[]" ]] && echo "has-upper=false" >> "$GITHUB_OUTPUT" || echo "has-upper=true" >> "$GITHUB_OUTPUT"
+        fi

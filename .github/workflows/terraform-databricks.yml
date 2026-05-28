@@ -50,152 +50,23 @@ jobs:
     runs-on: ${{ fromJson(needs._config.outputs.runners) }}
     needs: _config
     outputs:
-      matrix-plan: ${{ steps.build-matrix.outputs.matrix-plan }}
-      matrix-lower: ${{ steps.build-matrix.outputs.matrix-lower }}
-      matrix-upper: ${{ steps.build-matrix.outputs.matrix-upper }}
-      has-plan: ${{ steps.build-matrix.outputs.has-plan }}
-      has-lower: ${{ steps.build-matrix.outputs.has-lower }}
-      has-upper: ${{ steps.build-matrix.outputs.has-upper }}
+      matrix-plan: ${{ steps.build.outputs.matrix }}
+      matrix-lower: ${{ steps.build.outputs.matrix-lower }}
+      matrix-upper: ${{ steps.build.outputs.matrix-upper }}
+      has-plan: ${{ steps.build.outputs.has-pairs }}
+      has-lower: ${{ steps.build.outputs.has-lower }}
+      has-upper: ${{ steps.build.outputs.has-upper }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Build team/env matrix
-        id: build-matrix
-        env:
-          TEAM_INPUT: ${{ github.event.inputs.team || '' }}
-          ENV_INPUT: ${{ github.event.inputs.environment || '' }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          set -euo pipefail
-
-          # ── helpers (bash-glob iteration, matches the style used in
-          #    terraform-drift-detection.yml and the scheduled-backup job).
-          list_all_teams() {
-            for d in config/teams/*/; do
-              n=$(basename "$d")
-              [[ "$n" == _* ]] && continue
-              echo "$n"
-            done
-          }
-          list_envs_for_team() {
-            local team="$1"
-            for f in "config/teams/${team}/envs"/*.tfvars; do
-              [[ -e "$f" ]] || continue
-              basename "$f" .tfvars
-            done | sort
-          }
-
-          pairs=()
-
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$TEAM_INPUT" == "all" ]]; then
-              teams=$(list_all_teams)
-            else
-              teams="$TEAM_INPUT"
-            fi
-
-            for team in $teams; do
-              env_dir="config/teams/${team}/envs"
-              if [[ ! -d "$env_dir" ]]; then
-                echo "::warning::No envs/ directory found for team '$team', skipping"
-                continue
-              fi
-
-              all_envs=$(list_envs_for_team "$team")
-              if [[ -z "$all_envs" ]]; then
-                echo "::warning::No envs/*.tfvars files found for team '$team', skipping"
-                continue
-              fi
-
-              if [[ "$ENV_INPUT" == "all" ]]; then
-                envs="$all_envs"
-              else
-                envs="$ENV_INPUT"
-              fi
-
-              for env in $envs; do
-                if echo "$all_envs" | grep -qx "$env"; then
-                  env_meta=$(jq -c ".environments[\"$env\"] // empty" config/global/subscriptions.json)
-                  if [[ -z "$env_meta" ]]; then
-                    echo "::warning::No subscriptions.json entry for env '$env', skipping ${team}/${env}"
-                    continue
-                  fi
-                  sub_alias=$(jq -r '.subscription' <<<"$env_meta")
-                  requires_approval=$(jq -r '.requires_approval' <<<"$env_meta")
-                  pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${sub_alias}\",\"requires_approval\":${requires_approval}}")
-                else
-                  echo "::warning::Team '$team' does not have environment '$env', skipping"
-                fi
-              done
-            done
-
-          else
-            if [[ "$EVENT_NAME" == "pull_request" ]]; then
-              base_sha="${{ github.event.pull_request.base.sha }}"
-            else
-              base_sha="HEAD~1"
-            fi
-
-            changed_files=$(git diff --name-only "$base_sha" HEAD)
-            echo "Changed files:"
-            echo "$changed_files"
-
-            module_changed=$(echo "$changed_files" | grep -E "^terraform/(modules/databricks-workspace|databricks)/" | head -1 || true)
-
-            if [[ -n "$module_changed" ]]; then
-              echo "Module files changed — queuing all teams"
-              changed_teams=$(list_all_teams)
-            else
-              changed_teams=$(echo "$changed_files" | grep "^config/teams/" | sed 's|config/teams/||;s|/.*||' | grep -v '^_' | sort -u || true)
-            fi
-
-            for team in $changed_teams; do
-              env_dir="config/teams/${team}/envs"
-              [[ -d "$env_dir" ]] || continue
-
-              envs=$(list_envs_for_team "$team")
-              [[ -n "$envs" ]] || continue
-
-              for env in $envs; do
-                env_meta=$(jq -c ".environments[\"$env\"] // empty" config/global/subscriptions.json)
-                if [[ -z "$env_meta" ]]; then
-                  echo "::warning::No subscriptions.json entry for env '$env', skipping ${team}/${env}"
-                  continue
-                fi
-                sub_alias=$(jq -r '.subscription' <<<"$env_meta")
-                requires_approval=$(jq -r '.requires_approval' <<<"$env_meta")
-                pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${sub_alias}\",\"requires_approval\":${requires_approval}}")
-              done
-            done
-          fi
-
-          # Split into approval / no-approval buckets based on requires_approval
-          # from config/global/subscriptions.json — no env names hardcoded here.
-          if [[ ${#pairs[@]} -eq 0 ]]; then
-            echo "No teams to process"
-            echo "matrix-plan={\"include\":[]}"  >> "$GITHUB_OUTPUT"
-            echo "matrix-lower={\"include\":[]}" >> "$GITHUB_OUTPUT"
-            echo "matrix-upper={\"include\":[]}" >> "$GITHUB_OUTPUT"
-            echo "has-plan=false"                >> "$GITHUB_OUTPUT"
-            echo "has-lower=false"               >> "$GITHUB_OUTPUT"
-            echo "has-upper=false"               >> "$GITHUB_OUTPUT"
-          else
-            all_json=$(printf '%s\n' "${pairs[@]}" | jq -cs '.')
-            lower_json=$(jq -c 'map(select(.requires_approval == false))' <<<"$all_json")
-            upper_json=$(jq -c 'map(select(.requires_approval == true))'  <<<"$all_json")
-
-            echo "matrix-plan={\"include\":${all_json}}"   >> "$GITHUB_OUTPUT"
-            echo "has-plan=true"                            >> "$GITHUB_OUTPUT"
-            echo "Plan matrix: {\"include\":${all_json}}"
-
-            echo "matrix-lower={\"include\":${lower_json}}" >> "$GITHUB_OUTPUT"
-            echo "matrix-upper={\"include\":${upper_json}}" >> "$GITHUB_OUTPUT"
-
-            [[ "$lower_json" == "[]" ]] && echo "has-lower=false" >> "$GITHUB_OUTPUT" || echo "has-lower=true" >> "$GITHUB_OUTPUT"
-            [[ "$upper_json" == "[]" ]] && echo "has-upper=false" >> "$GITHUB_OUTPUT" || echo "has-upper=true" >> "$GITHUB_OUTPUT"
-          fi
+      - id: build
+        uses: ./.github/actions/build-team-env-matrix
+        with:
+          mode: auto
+          team_input: ${{ github.event.inputs.team || '' }}
+          env_input: ${{ github.event.inputs.environment || '' }}
+          split_by_approval: 'true'
 
   # ─────────────────────────────────────────────────────────────────────────────
   # Plan — runs for every team+env in the matrix
@@ -212,31 +83,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Validate team config files
-        env:
-          TEAM: ${{ matrix.team }}
-          ENVIRONMENT: ${{ matrix.environment }}
-        run: |
-          set -euo pipefail
-          TEAM_DIR="config/teams/${TEAM}"
-          COMMON="${TEAM_DIR}/common.tfvars"
-          ENV_FILE="${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars"
-
-          missing=()
-          [[ -f "$COMMON"   ]] || missing+=("$COMMON")
-          [[ -f "$ENV_FILE" ]] || missing+=("$ENV_FILE")
-
-          if (( ${#missing[@]} > 0 )); then
-            echo "::error::Missing required config files for ${TEAM}/${ENVIRONMENT}:"
-            printf '  - %s\n' "${missing[@]}"
-            exit 1
-          fi
-
-      - name: Resolve subscription credentials
-        id: sub
-        uses: ./.github/actions/resolve-subscription
+      - name: Prepare Terraform context
+        id: ctx
+        uses: ./.github/actions/prepare-terraform
         with:
           subscription_alias: ${{ matrix.subscription_alias }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
           azure_sub_dev_qa: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
           azure_client_dev_qa: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
           azure_sub_staging_prod: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
@@ -245,32 +97,12 @@ jobs:
           tf_sa_staging_prod: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
           tf_rg_dev_qa: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
           tf_rg_staging_prod: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ steps.sub.outputs.sub_id }}
-          client-id: ${{ steps.sub.outputs.client_id }}
-
-      - name: Setup Terraform
-        uses: ./.github/actions/setup-terraform
-        with:
+          validate_team_files: 'true'
+          team: ${{ matrix.team }}
+          environment: ${{ matrix.environment }}
           terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
-          environment: ${{ matrix.environment }}
-
-      - name: Terraform init
-        uses: ./.github/actions/terraform-init
-        with:
-          working_directory: terraform/databricks
-          storage_account: ${{ steps.sub.outputs.sa }}
-          container: ${{ steps.sub.outputs.container }}
-          resource_group: ${{ steps.sub.outputs.rg }}
           state_key: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
-          client_id: ${{ steps.sub.outputs.client_id }}
-          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription_id: ${{ steps.sub.outputs.sub_id }}
 
       - name: Terraform validate
         working-directory: terraform/databricks
@@ -281,10 +113,10 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
-          TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
+          TF_VAR_subscription_id: ${{ steps.ctx.outputs.sub_id }}
         run: |
           # -detailed-exitcode exits 0=no changes, 1=error, 2=changes present.
           # Disable pipefail around this command so exit code 2 is handled explicitly.
@@ -329,11 +161,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve subscription credentials
-        id: sub
-        uses: ./.github/actions/resolve-subscription
+      - name: Prepare Terraform context
+        id: ctx
+        uses: ./.github/actions/prepare-terraform
         with:
           subscription_alias: ${{ matrix.subscription_alias }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
           azure_sub_dev_qa: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
           azure_client_dev_qa: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
           azure_sub_staging_prod: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
@@ -342,20 +175,10 @@ jobs:
           tf_sa_staging_prod: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
           tf_rg_dev_qa: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
           tf_rg_staging_prod: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ steps.sub.outputs.sub_id }}
-          client-id: ${{ steps.sub.outputs.client_id }}
-
-      - name: Setup Terraform
-        uses: ./.github/actions/setup-terraform
-        with:
+          environment: ${{ matrix.environment }}
           terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
-          environment: ${{ matrix.environment }}
+          state_key: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
 
       - name: Download plan artifact
         uses: actions/download-artifact@v4
@@ -363,25 +186,13 @@ jobs:
           name: tfplan-${{ matrix.team }}-${{ matrix.environment }}
           path: terraform/databricks/
 
-      - name: Terraform init
-        uses: ./.github/actions/terraform-init
-        with:
-          working_directory: terraform/databricks
-          storage_account: ${{ steps.sub.outputs.sa }}
-          container: ${{ steps.sub.outputs.container }}
-          resource_group: ${{ steps.sub.outputs.rg }}
-          state_key: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
-          client_id: ${{ steps.sub.outputs.client_id }}
-          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription_id: ${{ steps.sub.outputs.sub_id }}
-
       - name: Terraform apply
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
         run: terraform apply -input=false tfplan
 
       - name: Notify Teams
@@ -412,11 +223,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve subscription credentials
-        id: sub
-        uses: ./.github/actions/resolve-subscription
+      - name: Prepare Terraform context
+        id: ctx
+        uses: ./.github/actions/prepare-terraform
         with:
           subscription_alias: ${{ matrix.subscription_alias }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
           azure_sub_dev_qa: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
           azure_client_dev_qa: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
           azure_sub_staging_prod: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
@@ -425,20 +237,10 @@ jobs:
           tf_sa_staging_prod: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
           tf_rg_dev_qa: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
           tf_rg_staging_prod: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ steps.sub.outputs.sub_id }}
-          client-id: ${{ steps.sub.outputs.client_id }}
-
-      - name: Setup Terraform
-        uses: ./.github/actions/setup-terraform
-        with:
+          environment: ${{ matrix.environment }}
           terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
-          environment: ${{ matrix.environment }}
+          state_key: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
 
       - name: Download plan artifact
         uses: actions/download-artifact@v4
@@ -446,25 +248,13 @@ jobs:
           name: tfplan-${{ matrix.team }}-${{ matrix.environment }}
           path: terraform/databricks/
 
-      - name: Terraform init
-        uses: ./.github/actions/terraform-init
-        with:
-          working_directory: terraform/databricks
-          storage_account: ${{ steps.sub.outputs.sa }}
-          container: ${{ steps.sub.outputs.container }}
-          resource_group: ${{ steps.sub.outputs.rg }}
-          state_key: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
-          client_id: ${{ steps.sub.outputs.client_id }}
-          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription_id: ${{ steps.sub.outputs.sub_id }}
-
       - name: Terraform apply
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
         run: terraform apply -input=false tfplan
 
       - name: Notify Teams

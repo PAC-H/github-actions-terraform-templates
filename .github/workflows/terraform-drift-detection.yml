@@ -34,36 +34,14 @@ jobs:
     needs: _config
     runs-on: ${{ fromJson(needs._config.outputs.runners) }}
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-      has-pairs: ${{ steps.matrix.outputs.has-pairs }}
+      matrix: ${{ steps.build.outputs.matrix }}
+      has-pairs: ${{ steps.build.outputs.has-pairs }}
     steps:
       - uses: actions/checkout@v4
-      - id: matrix
-        run: |
-          set -euo pipefail
-          pairs=()
-          for team_dir in config/teams/*/; do
-            team=$(basename "$team_dir")
-            [[ "$team" == _* ]] && continue
-            env_dir="${team_dir}envs"
-            [[ -d "$env_dir" ]] || continue
-            for env_file in "$env_dir"/*.tfvars; do
-              [[ -e "$env_file" ]] || continue
-              env=$(basename "$env_file" .tfvars)
-              alias=$(jq -r ".environments[\"$env\"].subscription // empty" config/global/subscriptions.json)
-              [[ -n "$alias" ]] || { echo "::warning::No subscription alias for env '$env', skipping ${team}/${env}"; continue; }
-              pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${alias}\"}")
-            done
-          done
-
-          if [[ ${#pairs[@]} -eq 0 ]]; then
-            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
-            echo "has-pairs=false"          >> "$GITHUB_OUTPUT"
-          else
-            joined=$(IFS=,; echo "${pairs[*]}")
-            echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
-            echo "has-pairs=true"                    >> "$GITHUB_OUTPUT"
-          fi
+      - id: build
+        uses: ./.github/actions/build-team-env-matrix
+        with:
+          mode: all
 
   drift:
     name: "Drift · ${{ matrix.team }} / ${{ matrix.environment }}"
@@ -77,11 +55,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve subscription credentials
-        id: sub
-        uses: ./.github/actions/resolve-subscription
+      - name: Prepare Terraform context
+        id: ctx
+        uses: ./.github/actions/prepare-terraform
         with:
           subscription_alias: ${{ matrix.subscription_alias }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
           azure_sub_dev_qa: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
           azure_client_dev_qa: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
           azure_sub_staging_prod: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
@@ -90,42 +69,20 @@ jobs:
           tf_sa_staging_prod: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
           tf_rg_dev_qa: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
           tf_rg_staging_prod: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ steps.sub.outputs.sub_id }}
-          client-id: ${{ steps.sub.outputs.client_id }}
-
-      - name: Setup Terraform
-        uses: ./.github/actions/setup-terraform
-        with:
+          environment: ${{ matrix.environment }}
           terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
-          environment: ${{ matrix.environment }}
-
-      - name: Terraform init
-        uses: ./.github/actions/terraform-init
-        with:
-          working_directory: terraform/databricks
-          storage_account: ${{ steps.sub.outputs.sa }}
-          container: ${{ steps.sub.outputs.container }}
-          resource_group: ${{ steps.sub.outputs.rg }}
           state_key: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
-          client_id: ${{ steps.sub.outputs.client_id }}
-          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription_id: ${{ steps.sub.outputs.sub_id }}
 
       - name: Check for drift
         id: check
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
-          TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
+          TF_VAR_subscription_id: ${{ steps.ctx.outputs.sub_id }}
         run: |
           set +e
           terraform plan \

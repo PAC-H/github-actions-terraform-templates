@@ -1,0 +1,158 @@
+name: 'Prepare Terraform Context'
+description: >
+  Bundles the prelude every team x env terraform job needs:
+  optionally validates team config files, resolves the subscription/state
+  credentials, performs OIDC Azure login, optionally installs terraform,
+  and optionally runs terraform init against the azurerm backend.
+  Callers pass the 8 azure/tf-state secrets and get back the resolved
+  client/subscription/state values for use in subsequent steps.
+
+inputs:
+  # ── Subscription routing (always required) ──────────────────────────────
+  subscription_alias:
+    description: "Subscription alias from subscriptions.json (e.g. 'dev-qa', 'staging-prod')."
+    required: true
+  tenant_id:
+    description: 'AZURE_TENANT_ID secret'
+    required: true
+  azure_sub_dev_qa:
+    description: 'AZURE_SUBSCRIPTION_DEV_QA secret'
+    required: true
+  azure_client_dev_qa:
+    description: 'AZURE_CLIENT_ID_DEV_QA secret'
+    required: true
+  azure_sub_staging_prod:
+    description: 'AZURE_SUBSCRIPTION_STAGING_PROD secret'
+    required: true
+  azure_client_staging_prod:
+    description: 'AZURE_CLIENT_ID_STAGING_PROD secret'
+    required: true
+  tf_sa_dev_qa:
+    description: 'TF_STATE_STORAGE_ACCOUNT_DEV_QA secret'
+    required: true
+  tf_sa_staging_prod:
+    description: 'TF_STATE_STORAGE_ACCOUNT_STAGING_PROD secret'
+    required: true
+  tf_rg_dev_qa:
+    description: 'TF_STATE_RESOURCE_GROUP_DEV_QA secret (only needed when state_key is set)'
+    required: false
+    default: ''
+  tf_rg_staging_prod:
+    description: 'TF_STATE_RESOURCE_GROUP_STAGING_PROD secret (only needed when state_key is set)'
+    required: false
+    default: ''
+
+  # ── Optional team-file validation ───────────────────────────────────────
+  validate_team_files:
+    description: "If 'true', verify common.tfvars and envs/<environment>.tfvars exist for the team."
+    required: false
+    default: 'false'
+  team:
+    description: 'Team slug (required when validate_team_files=true)'
+    required: false
+    default: ''
+  environment:
+    description: 'Environment name (required when validate_team_files=true, also used as setup-terraform cache key)'
+    required: false
+    default: ''
+
+  # ── Optional terraform tooling + init ───────────────────────────────────
+  terraform_version:
+    description: "Terraform version to install. Leave empty to skip terraform setup entirely."
+    required: false
+    default: ''
+  working_directory:
+    description: 'Working directory for terraform (required if terraform_version is set)'
+    required: false
+    default: ''
+  state_key:
+    description: "Blob key for the .tfstate file. If set, runs terraform init against the azurerm backend. Requires terraform_version + working_directory."
+    required: false
+    default: ''
+
+outputs:
+  sub_id:
+    description: 'Resolved Azure subscription ID'
+    value: ${{ steps.sub.outputs.sub_id }}
+  client_id:
+    description: 'Resolved Azure client ID for OIDC'
+    value: ${{ steps.sub.outputs.client_id }}
+  sa:
+    description: 'Resolved Terraform state storage account name'
+    value: ${{ steps.sub.outputs.sa }}
+  rg:
+    description: 'Resolved Terraform state resource group name'
+    value: ${{ steps.sub.outputs.rg }}
+  container:
+    description: 'Resolved Terraform state container name'
+    value: ${{ steps.sub.outputs.container }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate team config files
+      if: inputs.validate_team_files == 'true'
+      shell: bash
+      env:
+        TEAM: ${{ inputs.team }}
+        ENVIRONMENT: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        [[ -n "$TEAM"        ]] || { echo "::error::validate_team_files=true requires the 'team' input"; exit 1; }
+        [[ -n "$ENVIRONMENT" ]] || { echo "::error::validate_team_files=true requires the 'environment' input"; exit 1; }
+
+        TEAM_DIR="config/teams/${TEAM}"
+        COMMON="${TEAM_DIR}/common.tfvars"
+        ENV_FILE="${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars"
+
+        missing=()
+        [[ -f "$COMMON"   ]] || missing+=("$COMMON")
+        [[ -f "$ENV_FILE" ]] || missing+=("$ENV_FILE")
+
+        if (( ${#missing[@]} > 0 )); then
+          echo "::error::Missing required config files for ${TEAM}/${ENVIRONMENT}:"
+          printf '  - %s\n' "${missing[@]}"
+          exit 1
+        fi
+
+    - name: Resolve subscription credentials
+      id: sub
+      uses: ./.github/actions/resolve-subscription
+      with:
+        subscription_alias: ${{ inputs.subscription_alias }}
+        azure_sub_dev_qa: ${{ inputs.azure_sub_dev_qa }}
+        azure_client_dev_qa: ${{ inputs.azure_client_dev_qa }}
+        azure_sub_staging_prod: ${{ inputs.azure_sub_staging_prod }}
+        azure_client_staging_prod: ${{ inputs.azure_client_staging_prod }}
+        tf_sa_dev_qa: ${{ inputs.tf_sa_dev_qa }}
+        tf_sa_staging_prod: ${{ inputs.tf_sa_staging_prod }}
+        tf_rg_dev_qa: ${{ inputs.tf_rg_dev_qa }}
+        tf_rg_staging_prod: ${{ inputs.tf_rg_staging_prod }}
+
+    - name: Azure login (OIDC)
+      uses: azure/login@v2
+      with:
+        tenant-id: ${{ inputs.tenant_id }}
+        subscription-id: ${{ steps.sub.outputs.sub_id }}
+        client-id: ${{ steps.sub.outputs.client_id }}
+
+    - name: Setup Terraform
+      if: inputs.terraform_version != ''
+      uses: ./.github/actions/setup-terraform
+      with:
+        terraform_version: ${{ inputs.terraform_version }}
+        working_directory: ${{ inputs.working_directory }}
+        environment: ${{ inputs.environment || 'shared' }}
+
+    - name: Terraform init
+      if: inputs.state_key != ''
+      uses: ./.github/actions/terraform-init
+      with:
+        working_directory: ${{ inputs.working_directory }}
+        storage_account: ${{ steps.sub.outputs.sa }}
+        container: ${{ steps.sub.outputs.container }}
+        resource_group: ${{ steps.sub.outputs.rg }}
+        state_key: ${{ inputs.state_key }}
+        client_id: ${{ steps.sub.outputs.client_id }}
+        tenant_id: ${{ inputs.tenant_id }}
+        subscription_id: ${{ steps.sub.outputs.sub_id }}

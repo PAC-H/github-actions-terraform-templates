@@ -108,11 +108,6 @@ jobs:
               ;;
           esac
 
-          TEAM_DIR="config/teams/${TEAM}"
-          ENV_FILE="${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars"
-          [[ -f "${TEAM_DIR}/common.tfvars" ]] || fail "missing ${TEAM_DIR}/common.tfvars"
-          [[ -f "$ENV_FILE" ]]                 || fail "missing $ENV_FILE"
-
       - name: Resolve env to subscription alias
         id: alias
         env:
@@ -123,11 +118,12 @@ jobs:
           [[ -n "$a" ]] || { echo "::error::No subscription alias for env '$ENVIRONMENT'"; exit 1; }
           echo "alias=$a" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve subscription credentials
-        id: sub
-        uses: ./.github/actions/resolve-subscription
+      - name: Prepare Terraform context
+        id: ctx
+        uses: ./.github/actions/prepare-terraform
         with:
           subscription_alias: ${{ steps.alias.outputs.alias }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
           azure_sub_dev_qa: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
           azure_client_dev_qa: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
           azure_sub_staging_prod: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
@@ -136,43 +132,22 @@ jobs:
           tf_sa_staging_prod: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
           tf_rg_dev_qa: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
           tf_rg_staging_prod: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ steps.sub.outputs.sub_id }}
-          client-id: ${{ steps.sub.outputs.client_id }}
-
-      - name: Setup Terraform
-        if: github.event.inputs.operation != 'restore'
-        uses: ./.github/actions/setup-terraform
-        with:
-          terraform_version: ${{ needs._config.outputs.terraform_version }}
-          working_directory: terraform/databricks
+          validate_team_files: 'true'
+          team: ${{ github.event.inputs.team }}
           environment: ${{ github.event.inputs.environment }}
-
-      - name: Terraform init
-        if: github.event.inputs.operation != 'restore'
-        uses: ./.github/actions/terraform-init
-        with:
+          # Restore skips terraform tooling entirely — it operates on the blob, not state.
+          terraform_version: ${{ github.event.inputs.operation != 'restore' && needs._config.outputs.terraform_version || '' }}
           working_directory: terraform/databricks
-          storage_account: ${{ steps.sub.outputs.sa }}
-          container: ${{ steps.sub.outputs.container }}
-          resource_group: ${{ steps.sub.outputs.rg }}
-          state_key: "workspace/${{ github.event.inputs.team }}/${{ github.event.inputs.environment }}.tfstate"
-          client_id: ${{ steps.sub.outputs.client_id }}
-          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription_id: ${{ steps.sub.outputs.sub_id }}
+          state_key: ${{ github.event.inputs.operation != 'restore' && format('workspace/{0}/{1}.tfstate', github.event.inputs.team, github.event.inputs.environment) || '' }}
 
       - name: Unlock
         if: github.event.inputs.operation == 'unlock'
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
         run: terraform force-unlock -force "${{ github.event.inputs.lock_id }}"
 
       - name: List
@@ -180,9 +155,9 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
         run: |
           OUT="state-list-${{ github.event.inputs.team }}-${{ github.event.inputs.environment }}.txt"
           terraform state list | tee "$OUT"
@@ -192,9 +167,9 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
         run: |
           OUT="state-show-${{ github.event.inputs.team }}-${{ github.event.inputs.environment }}.txt"
           terraform state show "${{ github.event.inputs.resource_address }}" | tee "$OUT"
@@ -204,9 +179,9 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
         run: |
           set -euo pipefail
           if ! terraform state list | grep -qx "${{ github.event.inputs.resource_address }}"; then
@@ -225,8 +200,8 @@ jobs:
         env:
           BACKUP_ACCOUNT: ${{ needs._config.outputs.backup_account }}
           BACKUP_CONTAINER: ${{ needs._config.outputs.backup_container }}
-          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
-          CONTAINER: ${{ steps.sub.outputs.container }}
+          STORAGE_ACCOUNT: ${{ steps.ctx.outputs.sa }}
+          CONTAINER: ${{ steps.ctx.outputs.container }}
         run: |
           set -euo pipefail
           TS=$(date +%Y%m%d-%H%M%S)
@@ -252,8 +227,8 @@ jobs:
         env:
           BACKUP_ACCOUNT: ${{ needs._config.outputs.backup_account }}
           BACKUP_CONTAINER: ${{ needs._config.outputs.backup_container }}
-          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
-          CONTAINER: ${{ steps.sub.outputs.container }}
+          STORAGE_ACCOUNT: ${{ steps.ctx.outputs.sa }}
+          CONTAINER: ${{ steps.ctx.outputs.container }}
         run: |
           set -euo pipefail
           KEY="workspace/${{ github.event.inputs.team }}/${{ github.event.inputs.environment }}.tfstate"
@@ -325,35 +300,14 @@ jobs:
     needs: _config
     runs-on: ${{ fromJson(needs._config.outputs.runners) }}
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-      has-pairs: ${{ steps.matrix.outputs.has-pairs }}
+      matrix: ${{ steps.build.outputs.matrix }}
+      has-pairs: ${{ steps.build.outputs.has-pairs }}
     steps:
       - uses: actions/checkout@v4
-      - id: matrix
-        run: |
-          set -euo pipefail
-          pairs=()
-          for team_dir in config/teams/*/; do
-            team=$(basename "$team_dir")
-            [[ "$team" == _* ]] && continue
-            env_dir="${team_dir}envs"
-            [[ -d "$env_dir" ]] || continue
-            for env_file in "$env_dir"/*.tfvars; do
-              [[ -e "$env_file" ]] || continue
-              env=$(basename "$env_file" .tfvars)
-              alias=$(jq -r ".environments[\"$env\"].subscription // empty" config/global/subscriptions.json)
-              [[ -n "$alias" ]] || continue
-              pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${alias}\"}")
-            done
-          done
-          if [[ ${#pairs[@]} -eq 0 ]]; then
-            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
-            echo "has-pairs=false"          >> "$GITHUB_OUTPUT"
-          else
-            joined=$(IFS=,; echo "${pairs[*]}")
-            echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
-            echo "has-pairs=true"                    >> "$GITHUB_OUTPUT"
-          fi
+      - id: build
+        uses: ./.github/actions/build-team-env-matrix
+        with:
+          mode: all
 
   scheduled-backup:
     name: "Backup · ${{ matrix.team }} / ${{ matrix.environment }}"
@@ -366,31 +320,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve subscription credentials
-        id: sub
-        uses: ./.github/actions/resolve-subscription
+      - name: Prepare Azure context (no terraform setup)
+        id: ctx
+        uses: ./.github/actions/prepare-terraform
         with:
           subscription_alias: ${{ matrix.subscription_alias }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
           azure_sub_dev_qa: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
           azure_client_dev_qa: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
           azure_sub_staging_prod: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
           azure_client_staging_prod: ${{ secrets.AZURE_CLIENT_ID_STAGING_PROD }}
           tf_sa_dev_qa: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_DEV_QA }}
           tf_sa_staging_prod: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ steps.sub.outputs.sub_id }}
-          client-id: ${{ steps.sub.outputs.client_id }}
+          # terraform_version / state_key intentionally omitted — backup only needs az login.
 
       - name: Copy state to backup container
         env:
           BACKUP_ACCOUNT: ${{ needs._config.outputs.backup_account }}
           BACKUP_CONTAINER: ${{ needs._config.outputs.backup_container }}
-          STORAGE_ACCOUNT: ${{ steps.sub.outputs.sa }}
-          CONTAINER: ${{ steps.sub.outputs.container }}
+          STORAGE_ACCOUNT: ${{ steps.ctx.outputs.sa }}
+          CONTAINER: ${{ steps.ctx.outputs.container }}
         run: |
           set -euo pipefail
           TS=$(date +%Y%m%d-%H%M%S)

@@ -46,79 +46,18 @@ jobs:
     needs: _config
     runs-on: ${{ fromJson(needs._config.outputs.runners) }}
     outputs:
-      matrix: ${{ steps.matrix.outputs.matrix }}
-      has-pairs: ${{ steps.matrix.outputs.has-pairs }}
+      matrix: ${{ steps.build.outputs.matrix }}
+      has-pairs: ${{ steps.build.outputs.has-pairs }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - id: matrix
-        env:
-          TEAM_INPUT: ${{ github.event.inputs.team || '' }}
-          ENV_INPUT: ${{ github.event.inputs.environment || '' }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          set -euo pipefail
-
-          list_all_teams() {
-            for d in config/teams/*/; do
-              n=$(basename "$d")
-              [[ "$n" == _* ]] && continue
-              echo "$n"
-            done
-          }
-          list_envs_for_team() {
-            local team="$1"
-            for f in "config/teams/${team}/envs"/*.tfvars; do
-              [[ -e "$f" ]] || continue
-              basename "$f" .tfvars
-            done | sort
-          }
-
-          pairs=()
-
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$TEAM_INPUT" == "all" ]]; then
-              teams=$(list_all_teams)
-            else
-              teams="$TEAM_INPUT"
-            fi
-          else
-            # PR trigger — derive from changed files; module changes queue all teams
-            base_sha="${{ github.event.pull_request.base.sha }}"
-            changed=$(git diff --name-only "$base_sha" HEAD)
-            if echo "$changed" | grep -qE "^terraform/(modules/databricks-workspace|databricks)/"; then
-              teams=$(list_all_teams)
-            else
-              teams=$(echo "$changed" | grep "^config/teams/" | sed 's|config/teams/||;s|/.*||' | grep -v '^_' | sort -u || true)
-            fi
-          fi
-
-          for team in $teams; do
-            env_dir="config/teams/${team}/envs"
-            [[ -d "$env_dir" ]] || continue
-            all_envs=$(list_envs_for_team "$team")
-            if [[ "$EVENT_NAME" == "workflow_dispatch" && "$ENV_INPUT" != "all" ]]; then
-              envs="$ENV_INPUT"
-            else
-              envs="$all_envs"
-            fi
-            for env in $envs; do
-              echo "$all_envs" | grep -qx "$env" || continue
-              alias=$(jq -r ".environments[\"$env\"].subscription // empty" config/global/subscriptions.json)
-              [[ -n "$alias" ]] || continue
-              pairs+=("{\"team\":\"${team}\",\"environment\":\"${env}\",\"subscription_alias\":\"${alias}\"}")
-            done
-          done
-
-          if [[ ${#pairs[@]} -eq 0 ]]; then
-            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
-            echo "has-pairs=false"          >> "$GITHUB_OUTPUT"
-          else
-            joined=$(IFS=,; echo "${pairs[*]}")
-            echo "matrix={\"include\":[${joined}]}" >> "$GITHUB_OUTPUT"
-            echo "has-pairs=true"                    >> "$GITHUB_OUTPUT"
-          fi
+      - id: build
+        uses: ./.github/actions/build-team-env-matrix
+        with:
+          mode: auto
+          team_input: ${{ github.event.inputs.team || '' }}
+          env_input: ${{ github.event.inputs.environment || '' }}
 
   compliance:
     name: "Compliance · ${{ matrix.team }} / ${{ matrix.environment }}"
@@ -132,11 +71,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve subscription credentials
-        id: sub
-        uses: ./.github/actions/resolve-subscription
+      - name: Prepare Terraform context
+        id: ctx
+        uses: ./.github/actions/prepare-terraform
         with:
           subscription_alias: ${{ matrix.subscription_alias }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
           azure_sub_dev_qa: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
           azure_client_dev_qa: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
           azure_sub_staging_prod: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
@@ -145,6 +85,10 @@ jobs:
           tf_sa_staging_prod: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
           tf_rg_dev_qa: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
           tf_rg_staging_prod: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
+          environment: ${{ matrix.environment }}
+          terraform_version: ${{ needs._config.outputs.terraform_version }}
+          working_directory: terraform/databricks
+          state_key: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
 
       - name: Resolve resource group from tfvars
         id: rg
@@ -157,40 +101,14 @@ jobs:
           RG=$(grep -E '^[[:space:]]*resource_group_name[[:space:]]*=' "$ENV_FILE" | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/' || true)
           echo "name=$RG" >> "$GITHUB_OUTPUT"
 
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ steps.sub.outputs.sub_id }}
-          client-id: ${{ steps.sub.outputs.client_id }}
-
-      - name: Setup Terraform
-        uses: ./.github/actions/setup-terraform
-        with:
-          terraform_version: ${{ needs._config.outputs.terraform_version }}
-          working_directory: terraform/databricks
-          environment: ${{ matrix.environment }}
-
-      - name: Terraform init
-        uses: ./.github/actions/terraform-init
-        with:
-          working_directory: terraform/databricks
-          storage_account: ${{ steps.sub.outputs.sa }}
-          container: ${{ steps.sub.outputs.container }}
-          resource_group: ${{ steps.sub.outputs.rg }}
-          state_key: "workspace/${{ matrix.team }}/${{ matrix.environment }}.tfstate"
-          client_id: ${{ steps.sub.outputs.client_id }}
-          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription_id: ${{ steps.sub.outputs.sub_id }}
-
       - name: Terraform plan (for scanning)
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
-          TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
+          TF_VAR_subscription_id: ${{ steps.ctx.outputs.sub_id }}
         run: |
           terraform plan \
             -var-file=../../config/teams/${{ matrix.team }}/common.tfvars \

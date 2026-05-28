@@ -149,10 +149,6 @@ jobs:
           [[ -n "$TEAM" ]]        || fail "team input is required"
           [[ -n "$ENVIRONMENT" ]] || fail "environment input is required"
 
-          TEAM_DIR="config/teams/${TEAM}"
-          [[ -f "${TEAM_DIR}/common.tfvars"  ]]         || fail "missing ${TEAM_DIR}/common.tfvars"
-          [[ -f "${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars" ]] || fail "missing ${TEAM_DIR}/envs/${ENVIRONMENT}.tfvars"
-
           case "$OP" in
             target-apply|target-destroy)
               [[ -n "${{ github.event.inputs.target_resources }}" ]] || fail "target_resources required for $OP"
@@ -179,11 +175,12 @@ jobs:
           [[ -n "$a" ]] || { echo "::error::No subscription alias for env '$ENVIRONMENT'"; exit 1; }
           echo "alias=$a" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve subscription credentials
-        id: sub
-        uses: ./.github/actions/resolve-subscription
+      - name: Prepare Terraform context
+        id: ctx
+        uses: ./.github/actions/prepare-terraform
         with:
           subscription_alias: ${{ steps.alias.outputs.alias }}
+          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
           azure_sub_dev_qa: ${{ secrets.AZURE_SUBSCRIPTION_DEV_QA }}
           azure_client_dev_qa: ${{ secrets.AZURE_CLIENT_ID_DEV_QA }}
           azure_sub_staging_prod: ${{ secrets.AZURE_SUBSCRIPTION_STAGING_PROD }}
@@ -192,32 +189,12 @@ jobs:
           tf_sa_staging_prod: ${{ secrets.TF_STATE_STORAGE_ACCOUNT_STAGING_PROD }}
           tf_rg_dev_qa: ${{ secrets.TF_STATE_RESOURCE_GROUP_DEV_QA }}
           tf_rg_staging_prod: ${{ secrets.TF_STATE_RESOURCE_GROUP_STAGING_PROD }}
-
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ steps.sub.outputs.sub_id }}
-          client-id: ${{ steps.sub.outputs.client_id }}
-
-      - name: Setup Terraform
-        uses: ./.github/actions/setup-terraform
-        with:
+          validate_team_files: 'true'
+          team: ${{ github.event.inputs.team }}
+          environment: ${{ github.event.inputs.environment }}
           terraform_version: ${{ needs._config.outputs.terraform_version }}
           working_directory: terraform/databricks
-          environment: ${{ github.event.inputs.environment }}
-
-      - name: Terraform init
-        uses: ./.github/actions/terraform-init
-        with:
-          working_directory: terraform/databricks
-          storage_account: ${{ steps.sub.outputs.sa }}
-          container: ${{ steps.sub.outputs.container }}
-          resource_group: ${{ steps.sub.outputs.rg }}
           state_key: "workspace/${{ github.event.inputs.team }}/${{ github.event.inputs.environment }}.tfstate"
-          client_id: ${{ steps.sub.outputs.client_id }}
-          tenant_id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription_id: ${{ steps.sub.outputs.sub_id }}
 
       # ── dependency-graph ──────────────────────────────────────────────────
       - name: Install graphviz
@@ -249,10 +226,10 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
-          TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
+          TF_VAR_subscription_id: ${{ steps.ctx.outputs.sub_id }}
         run: |
           DESTROY_FLAG=""
           [[ "${{ github.event.inputs.operation }}" == "target-destroy" ]] && DESTROY_FLAG="-destroy"
@@ -266,9 +243,9 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
         run: terraform apply -input=false target.tfplan
 
       # ── imports ──────────────────────────────────────────────────────────
@@ -277,9 +254,9 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
         run: |
           TS=$(date +%Y%m%d-%H%M%S)
           BACKUP="pre-import-${{ github.event.inputs.team }}-${{ github.event.inputs.environment }}-${TS}.tfstate"
@@ -291,9 +268,9 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
         run: |
           set -euo pipefail
           CONFIG="../../${{ github.event.inputs.import_config_file }}"
@@ -324,10 +301,10 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
-          TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
+          TF_VAR_subscription_id: ${{ steps.ctx.outputs.sub_id }}
         run: |
           terraform import \
             -var-file=../../config/teams/${{ github.event.inputs.team }}/common.tfvars \
@@ -340,10 +317,10 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
-          TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
+          TF_VAR_subscription_id: ${{ steps.ctx.outputs.sub_id }}
         run: |
           set -euo pipefail
           CONFIG="../../${{ github.event.inputs.import_config_file }}"
@@ -372,10 +349,10 @@ jobs:
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.sub.outputs.client_id }}
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
           ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.sub.outputs.sub_id }}
-          TF_VAR_subscription_id: ${{ steps.sub.outputs.sub_id }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
+          TF_VAR_subscription_id: ${{ steps.ctx.outputs.sub_id }}
         run: |
           set +e
           terraform plan -detailed-exitcode \
