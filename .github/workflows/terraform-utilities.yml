@@ -5,9 +5,14 @@ name: Terraform Utilities
 #   dependency-graph  — render terraform graph for a team × env
 #   target-apply      — apply a subset of resources
 #   target-destroy    — destroy a subset of resources
-#   import-individual — import one resource into state
-#   import-bulk       — import many from a JSON file
-#   import-dry-run    — validate an import plan without executing
+#   import-plan       — config-driven import preview: renders import{} blocks, runs
+#                       `terraform plan -generate-config-out`, uploads the generated
+#                       HCL + plan for review. No state change.
+#   import-apply      — performs the config-driven import via plan -out + apply.
+#
+# import-plan/import-apply take EITHER a bulk file (import_config_file) OR a single
+# resource_address + resource_id pair. Both render `import {}` blocks (Terraform >= 1.5)
+# rather than the legacy imperative `terraform import` command.
 
 on:
   workflow_dispatch:
@@ -21,9 +26,8 @@ on:
           - dependency-graph
           - target-apply
           - target-destroy
-          - import-individual
-          - import-bulk
-          - import-dry-run
+          - import-plan
+          - import-apply
       team:
         description: "Team name (folder under config/teams/). Required for everything except tfupdate."
         required: false
@@ -40,13 +44,13 @@ on:
         description: 'Comma-separated target addresses (for target-apply/destroy)'
         required: false
       import_resource_address:
-        description: 'Terraform resource address (for import-individual)'
+        description: 'Single-import: Terraform resource address (use instead of import_config_file)'
         required: false
       import_resource_id:
-        description: 'Azure resource ID (for import-individual)'
+        description: 'Single-import: Azure resource ID (use instead of import_config_file)'
         required: false
       import_config_file:
-        description: "Bulk-import config file (e.g. config/imports/<team>/<env>-imports.json)"
+        description: "Bulk-import config file (e.g. config/imports/<team>/<env>-imports.json). Use instead of the resource_address/id pair."
         required: false
   push:
     paths:
@@ -128,9 +132,8 @@ jobs:
       github.event.inputs.operation == 'dependency-graph' ||
       github.event.inputs.operation == 'target-apply'    ||
       github.event.inputs.operation == 'target-destroy'  ||
-      github.event.inputs.operation == 'import-individual' ||
-      github.event.inputs.operation == 'import-bulk' ||
-      github.event.inputs.operation == 'import-dry-run'
+      github.event.inputs.operation == 'import-plan' ||
+      github.event.inputs.operation == 'import-apply'
     needs: _config
     runs-on: ${{ fromJson(needs._config.outputs.runners) }}
     environment: ${{ contains(fromJson(needs._config.outputs.approval_envs), github.event.inputs.environment) && format('databricks-{0}', github.event.inputs.environment) || '' }}
@@ -153,15 +156,20 @@ jobs:
             target-apply|target-destroy)
               [[ -n "${{ github.event.inputs.target_resources }}" ]] || fail "target_resources required for $OP"
               ;;
-            import-individual)
-              [[ -n "${{ github.event.inputs.import_resource_address }}" ]] || fail "import_resource_address required"
-              [[ -n "${{ github.event.inputs.import_resource_id }}" ]]      || fail "import_resource_id required"
-              ;;
-            import-bulk|import-dry-run)
+            import-plan|import-apply)
               FILE="${{ github.event.inputs.import_config_file }}"
-              [[ -n "$FILE" ]] || fail "import_config_file required"
-              [[ -f "$FILE" ]] || fail "import_config_file not found: $FILE"
-              jq empty "$FILE" 2>/dev/null || fail "import_config_file is not valid JSON"
+              ADDR="${{ github.event.inputs.import_resource_address }}"
+              ID="${{ github.event.inputs.import_resource_id }}"
+              if [[ -n "$FILE" ]]; then
+                [[ -z "$ADDR" && -z "$ID" ]] || fail "provide either import_config_file OR the address/id pair, not both"
+                [[ -f "$FILE" ]] || fail "import_config_file not found: $FILE"
+                jq empty "$FILE" 2>/dev/null || fail "import_config_file is not valid JSON"
+                jq -e '.imports | type == "array" and length > 0' "$FILE" >/dev/null \
+                  || fail "import_config_file must contain a non-empty .imports array"
+              else
+                [[ -n "$ADDR" ]] || fail "import_resource_address required (or supply import_config_file)"
+                [[ -n "$ID" ]]   || fail "import_resource_id required (or supply import_config_file)"
+              fi
               ;;
           esac
 
@@ -248,9 +256,45 @@ jobs:
           ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
         run: terraform apply -input=false target.tfplan
 
-      # ── imports ──────────────────────────────────────────────────────────
+      # ── imports (config-driven: import {} blocks + generate-config-out) ───
+      # Renders Terraform `import {}` blocks (>= 1.5) from either a bulk JSON file
+      # or the single address/id pair, then previews (import-plan) or performs
+      # (import-apply) the import through the normal plan/apply lifecycle.
+      - name: Render import blocks
+        if: github.event.inputs.operation == 'import-plan' || github.event.inputs.operation == 'import-apply'
+        working-directory: terraform/databricks
+        env:
+          IMPORT_FILE: ${{ github.event.inputs.import_config_file }}
+          IMPORT_ADDR: ${{ github.event.inputs.import_resource_address }}
+          IMPORT_ID: ${{ github.event.inputs.import_resource_id }}
+        run: |
+          set -euo pipefail
+          OUT="generated_imports.tf"
+          {
+            echo "# AUTO-GENERATED by terraform-utilities.yml — ephemeral, do not commit."
+            echo "# Source: ${IMPORT_FILE:-inline address/id inputs}"
+          } > "$OUT"
+          emit() {
+            local addr="$1" id="$2"
+            [[ -n "$addr" && "$addr" != "null" ]] || { echo "::error::empty import resource_address"; exit 1; }
+            [[ -n "$id"   && "$id"   != "null" ]] || { echo "::error::empty import resource_id";      exit 1; }
+            printf 'import {\n  to = %s\n  id = "%s"\n}\n' "$addr" "$id" >> "$OUT"
+          }
+          if [[ -n "$IMPORT_FILE" ]]; then
+            CONFIG="../../$IMPORT_FILE"
+            COUNT=$(jq '.imports | length' "$CONFIG")
+            for i in $(seq 0 $((COUNT - 1))); do
+              emit "$(jq -r ".imports[$i].resource_address" "$CONFIG")" \
+                   "$(jq -r ".imports[$i].resource_id" "$CONFIG")"
+            done
+          else
+            emit "$IMPORT_ADDR" "$IMPORT_ID"
+          fi
+          echo "Rendered import blocks:"
+          cat "$OUT"
+
       - name: Pre-import state backup
-        if: github.event.inputs.operation == 'import-individual' || github.event.inputs.operation == 'import-bulk'
+        if: github.event.inputs.operation == 'import-apply'
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
@@ -263,41 +307,12 @@ jobs:
           terraform state pull > "$BACKUP"
           echo "Pre-import state backup written to $BACKUP (uploaded via artifact glob)"
 
-      - name: Import dry-run
-        if: github.event.inputs.operation == 'import-dry-run' || github.event.inputs.operation == 'import-bulk'
-        working-directory: terraform/databricks
-        env:
-          ARM_USE_OIDC: "true"
-          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
-          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
-        run: |
-          set -euo pipefail
-          CONFIG="../../${{ github.event.inputs.import_config_file }}"
-          REPORT="import-validation-${{ github.event.inputs.team }}-${{ github.event.inputs.environment }}.md"
-          {
-            echo "# Import validation"
-            echo "- Team: ${{ github.event.inputs.team }}"
-            echo "- Env:  ${{ github.event.inputs.environment }}"
-            echo "- File: ${{ github.event.inputs.import_config_file }}"
-            echo ""
-          } > "$REPORT"
-          COUNT=$(jq '.imports | length' "$CONFIG")
-          for i in $(seq 0 $((COUNT - 1))); do
-            ADDR=$(jq -r ".imports[$i].resource_address" "$CONFIG")
-            ID=$(jq -r ".imports[$i].resource_id" "$CONFIG")
-            echo "## $ADDR" >> "$REPORT"
-            if terraform state show "$ADDR" >/dev/null 2>&1; then
-              echo "- Already in state (will be skipped)" >> "$REPORT"
-            elif az resource show --ids "$ID" >/dev/null 2>&1; then
-              echo "- Ready for import" >> "$REPORT"
-            else
-              echo "- Azure resource NOT found" >> "$REPORT"
-            fi
-          done
-
-      - name: Execute import-individual
-        if: github.event.inputs.operation == 'import-individual'
+      # import-plan: preview only. `-generate-config-out` writes HCL for any import
+      # target that does not yet have a resource block (already-coded resources, like
+      # the module workspace, yield an empty file — that is expected and correct).
+      # It cannot be combined with -out, so this phase saves no plan and changes no state.
+      - name: Import plan + generate config
+        if: github.event.inputs.operation == 'import-plan'
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
@@ -306,14 +321,28 @@ jobs:
           ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
           TF_VAR_subscription_id: ${{ steps.ctx.outputs.sub_id }}
         run: |
-          terraform import \
+          set -euo pipefail
+          rm -f workspace.generated.tf
+          set +e
+          terraform plan \
+            -generate-config-out=workspace.generated.tf \
             -var-file=../../config/teams/${{ github.event.inputs.team }}/common.tfvars \
             -var-file=../../config/teams/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
-            "${{ github.event.inputs.import_resource_address }}" \
-            "${{ github.event.inputs.import_resource_id }}"
+            -input=false 2>&1 | tee import.plan.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          [[ $rc -eq 0 ]] || { echo "::error::import plan failed (exit $rc)"; exit "$rc"; }
+          if [[ -s workspace.generated.tf ]]; then
+            echo "::notice::Generated HCL written to workspace.generated.tf — review it, then fold the resource(s) into the module before running import-apply."
+          else
+            echo "::notice::No config generated — every import target already has a resource block (expected for already-coded resources). Proceed to import-apply."
+          fi
+          echo "Reviewed via import.plan.txt + workspace.generated.tf (run artifacts). No state changed."
 
-      - name: Execute import-bulk
-        if: github.event.inputs.operation == 'import-bulk'
+      # import-apply: perform the import through a saved plan, so the import is
+      # reviewable in the plan output and applied atomically.
+      - name: Import plan (for apply)
+        if: github.event.inputs.operation == 'import-apply'
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
@@ -323,29 +352,23 @@ jobs:
           TF_VAR_subscription_id: ${{ steps.ctx.outputs.sub_id }}
         run: |
           set -euo pipefail
-          CONFIG="../../${{ github.event.inputs.import_config_file }}"
-          COUNT=$(jq '.imports | length' "$CONFIG")
-          ok=0; fail=0
-          for i in $(seq 0 $((COUNT - 1))); do
-            ADDR=$(jq -r ".imports[$i].resource_address" "$CONFIG")
-            ID=$(jq -r ".imports[$i].resource_id" "$CONFIG")
-            if terraform state show "$ADDR" >/dev/null 2>&1; then
-              echo "Skip (in state): $ADDR"; continue
-            fi
-            if terraform import \
-                 -var-file=../../config/teams/${{ github.event.inputs.team }}/common.tfvars \
-                 -var-file=../../config/teams/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
-                 "$ADDR" "$ID"; then
-              ok=$((ok+1))
-            else
-              fail=$((fail+1))
-            fi
-          done
-          echo "Bulk import: $ok successful, $fail failed"
-          [[ $fail -eq 0 ]]
+          terraform plan \
+            -var-file=../../config/teams/${{ github.event.inputs.team }}/common.tfvars \
+            -var-file=../../config/teams/${{ github.event.inputs.team }}/envs/${{ github.event.inputs.environment }}.tfvars \
+            -out=import.tfplan -input=false 2>&1 | tee import.plan.txt
+
+      - name: Import apply
+        if: github.event.inputs.operation == 'import-apply'
+        working-directory: terraform/databricks
+        env:
+          ARM_USE_OIDC: "true"
+          ARM_CLIENT_ID: ${{ steps.ctx.outputs.client_id }}
+          ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ steps.ctx.outputs.sub_id }}
+        run: terraform apply -input=false import.tfplan
 
       - name: Post-import verify
-        if: github.event.inputs.operation == 'import-individual' || github.event.inputs.operation == 'import-bulk'
+        if: github.event.inputs.operation == 'import-apply'
         working-directory: terraform/databricks
         env:
           ARM_USE_OIDC: "true"
@@ -386,7 +409,10 @@ jobs:
             terraform/databricks/target.tfplan
             terraform/databricks/post-import.tfplan
             terraform/databricks/pre-import-*.tfstate
-            terraform/databricks/import-validation-*.md
+            terraform/databricks/workspace.generated.tf
+            terraform/databricks/generated_imports.tf
+            terraform/databricks/import.tfplan
+            terraform/databricks/import.plan.txt
           if-no-files-found: ignore
           retention-days: 30
 

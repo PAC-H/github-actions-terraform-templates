@@ -1,4 +1,5 @@
 {
+  "_comment": "Each entry is rendered into a Terraform `import {}` block (TF >= 1.5) by terraform-utilities.yml. Run the 'import-plan' operation first (preview + generate-config-out), then 'import-apply'. resource_address is the in-config address; resource_id is the full Azure resource ID.",
   "imports": [
     {
       "resource_address": "module.databricks_workspace.azurerm_databricks_workspace.this",
